@@ -32,7 +32,9 @@
       </button>
     </div>
 
-    <div class="title-text"><ModeDropdown /></div>
+    <div class="title-text">
+      <ModeDropdown />
+    </div>
 
     <div class="titlebar-actions" data-no-drag @dblclick.stop>
       <button

@@ -13,7 +13,7 @@ use std::{
   fs,
   path::{Path, PathBuf},
   str::FromStr,
-  sync::Mutex,
+  sync::{Mutex, OnceLock},
   time::Duration,
 };
 use tauri::{
@@ -34,6 +34,9 @@ const MINI_PET_WIDTH: f64 = 80.0;
 const MINI_PET_HEIGHT: f64 = 80.0;
 const MINI_PILL_WIDTH: f64 = 176.0;
 const MINI_PILL_HEIGHT: f64 = 44.0;
+const FOCUS_MINI_MIN_WIDTH: f64 = 120.0;
+const FOCUS_MINI_MAX_WIDTH: f64 = 320.0;
+const FOCUS_MINI_HEIGHT: f64 = 44.0;
 const CONFIG_FILE_NAME: &str = "config.json";
 const DB_FILE_NAME: &str = "tasks.db";
 const TASK_ORDER_FILE_NAME: &str = "task_order.json";
@@ -132,6 +135,7 @@ struct WindowStatePayload {
 struct WindowModeChangedPayload {
   mode: String,
   mini_mode: bool,
+  focus_mini: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -295,11 +299,22 @@ struct ConfigPayload {
   priority_normal_value: String,
 }
 
+#[derive(Debug, Clone)]
+struct FeishuFieldOption {
+  id: String,
+  name: String,
+  color: Option<i64>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct FeishuFieldPayload {
+  #[serde(skip_serializing)]
+  field_id: String,
   field_name: String,
   field_type: i64,
   options: Vec<String>,
+  #[serde(skip_serializing)]
+  option_details: Vec<FeishuFieldOption>,
 }
 
 #[derive(Debug, Default)]
@@ -983,7 +998,11 @@ fn upsert_task(conn: &Connection, task: &Task) -> Result<(), String> {
         notes=CASE WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.notes ELSE excluded.notes END,
         sort_order=excluded.sort_order,
         sub_tasks=CASE WHEN excluded.source = 'feishu' AND excluded.sub_tasks = '[]' THEN tasks.sub_tasks ELSE excluded.sub_tasks END,
-        tags=CASE WHEN excluded.source = 'feishu' AND excluded.tags = '' THEN tasks.tags ELSE excluded.tags END,
+        tags=CASE
+          WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.tags
+          WHEN excluded.source = 'feishu' AND excluded.tags = '' THEN tasks.tags
+          ELSE excluded.tags
+        END,
         due_date=CASE WHEN excluded.source = 'feishu' AND excluded.due_date = '' THEN tasks.due_date ELSE excluded.due_date END,
         recurrence_rule=CASE WHEN excluded.source = 'feishu' AND excluded.recurrence_rule = '' THEN tasks.recurrence_rule ELSE excluded.recurrence_rule END,
         recurrence_parent_id=CASE WHEN excluded.source = 'feishu' AND excluded.recurrence_parent_id = '' THEN tasks.recurrence_parent_id ELSE excluded.recurrence_parent_id END,
@@ -1061,6 +1080,16 @@ fn apply_mini_mode(app: &AppHandle, window: &WebviewWindow) -> tauri::Result<()>
   window.set_min_size(Some(mini_size))?;
   window.set_max_size(Some(mini_size))?;
   window.set_size(mini_size)?;
+  Ok(())
+}
+
+fn apply_focus_mini_mode(window: &WebviewWindow, requested_width: f64) -> tauri::Result<()> {
+  let width = requested_width.clamp(FOCUS_MINI_MIN_WIDTH, FOCUS_MINI_MAX_WIDTH);
+  let size = Size::Logical(LogicalSize::new(width, FOCUS_MINI_HEIGHT));
+  window.set_resizable(false)?;
+  window.set_min_size(Some(size))?;
+  window.set_max_size(Some(size))?;
+  window.set_size(size)?;
   Ok(())
 }
 
@@ -1200,6 +1229,7 @@ fn toggle_window_visibility(app: &AppHandle) -> tauri::Result<()> {
         WindowModeChangedPayload {
           mode: if mini_mode { "cat" } else { "panel" }.to_string(),
           mini_mode,
+          focus_mini: false,
         },
       );
     }
@@ -1927,7 +1957,7 @@ fn insert_feishu_field_if_exists(
   }
 }
 
-fn parse_feishu_field_options(item: &Value) -> Vec<String> {
+fn parse_feishu_field_option_details(item: &Value) -> Vec<FeishuFieldOption> {
   item
     .get("property")
     .and_then(|property| property.get("options"))
@@ -1935,18 +1965,61 @@ fn parse_feishu_field_options(item: &Value) -> Vec<String> {
     .map(|options| {
       options
         .iter()
-        .filter_map(|option| {
-          option
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| option.as_str())
+        .filter_map(|option| match option {
+          Value::String(name) => Some(FeishuFieldOption {
+            id: String::new(),
+            name: name.trim().to_string(),
+            color: None,
+          }),
+          Value::Object(map) => Some(FeishuFieldOption {
+            id: map
+              .get("id")
+              .and_then(Value::as_str)
+              .unwrap_or_default()
+              .trim()
+              .to_string(),
+            name: map
+              .get("name")
+              .and_then(Value::as_str)
+              .unwrap_or_default()
+              .trim()
+              .to_string(),
+            color: map.get("color").and_then(Value::as_i64),
+          }),
+          _ => None,
         })
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
+        .filter(|option| !option.name.is_empty())
         .collect()
     })
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn parse_feishu_field_options(item: &Value) -> Vec<String> {
+  parse_feishu_field_option_details(item)
+    .into_iter()
+    .map(|option| option.name)
+    .collect()
+}
+
+fn parse_feishu_field_payload(item: &Value) -> Option<FeishuFieldPayload> {
+  let field_name = item.get("field_name")?.as_str()?.trim().to_string();
+  if field_name.is_empty() {
+    return None;
+  }
+  let option_details = parse_feishu_field_option_details(item);
+  Some(FeishuFieldPayload {
+    field_id: item
+      .get("field_id")
+      .and_then(Value::as_str)
+      .unwrap_or_default()
+      .trim()
+      .to_string(),
+    field_name,
+    field_type: item.get("type").and_then(Value::as_i64).unwrap_or_default(),
+    options: option_details.iter().map(|option| option.name.clone()).collect(),
+    option_details,
+  })
 }
 
 async fn feishu_list_fields(app: &AppHandle) -> Result<Vec<FeishuFieldPayload>, String> {
@@ -2012,17 +2085,7 @@ async fn feishu_list_fields(app: &AppHandle) -> Result<Vec<FeishuFieldPayload>, 
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-      fields.extend(items.iter().filter_map(|item| {
-        let field_name = item.get("field_name")?.as_str()?.trim().to_string();
-        if field_name.is_empty() {
-          return None;
-        }
-        Some(FeishuFieldPayload {
-          field_name,
-          field_type: item.get("type").and_then(Value::as_i64).unwrap_or_default(),
-          options: parse_feishu_field_options(item),
-        })
-      }));
+      fields.extend(items.iter().filter_map(parse_feishu_field_payload));
 
       if !data.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(fields);
@@ -2109,6 +2172,168 @@ fn feishu_tag_field<'a>(fields: &'a [FeishuFieldPayload], field_name: &str) -> O
   fields.iter().find(|field| field.field_name == field_name)
 }
 
+fn feishu_field_update_lock() -> &'static tokio::sync::Mutex<()> {
+  static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+  LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn feishu_option_request_value(option: &FeishuFieldOption) -> Value {
+  let mut value = serde_json::Map::new();
+  if !option.id.trim().is_empty() {
+    value.insert("id".to_string(), Value::String(option.id.clone()));
+  }
+  value.insert("name".to_string(), Value::String(option.name.clone()));
+  if let Some(color) = option.color {
+    value.insert("color".to_string(), Value::Number(color.into()));
+  }
+  Value::Object(value)
+}
+
+fn merge_feishu_multi_select_options(
+  existing: &[FeishuFieldOption],
+  desired: &[String],
+) -> (Vec<Value>, Vec<String>) {
+  let mut values = existing
+    .iter()
+    .map(feishu_option_request_value)
+    .collect::<Vec<_>>();
+  let mut missing = Vec::new();
+
+  for tag in desired {
+    if existing.iter().any(|option| option.name == *tag)
+      || missing.iter().any(|option: &String| option == tag)
+    {
+      continue;
+    }
+    missing.push(tag.clone());
+    values.push(json!({ "name": tag }));
+  }
+
+  (values, missing)
+}
+
+async fn feishu_ensure_multi_select_options(
+  app: &AppHandle,
+  field_name: &str,
+  desired: &[String],
+) -> Result<FeishuFieldPayload, String> {
+  let _guard = feishu_field_update_lock().lock().await;
+  let fields = feishu_list_fields(app).await?;
+  let field = feishu_tag_field(&fields, field_name)
+    .cloned()
+    .ok_or_else(|| format!("已绑定的标签字段不存在：{}", field_name))?;
+
+  if field.field_type != 4 || desired.is_empty() {
+    return Ok(field);
+  }
+
+  let (options, missing) = merge_feishu_multi_select_options(&field.option_details, desired);
+  if missing.is_empty() {
+    return Ok(field);
+  }
+  if field.field_id.trim().is_empty() {
+    return Err(format!("无法读取飞书标签字段「{}」的 Field ID", field_name));
+  }
+
+  let config = load_app_config_from_file(app)?;
+  let endpoint = format!(
+    "https://open.feishu.cn/open-apis/bitable/v1/apps/{}/tables/{}/fields/{}",
+    config.feishu.app_token.trim(),
+    config.feishu.table_id.trim(),
+    field.field_id.trim()
+  );
+  let client = build_feishu_http_client()?;
+
+  for attempt in 0..2 {
+    let token = get_tenant_access_token(app, attempt == 1).await?;
+    let response = client
+      .put(&endpoint)
+      .header("Content-Type", "application/json")
+      .header("Authorization", format!("Bearer {}", token))
+      .json(&json!({
+        "field_name": field.field_name,
+        "type": field.field_type,
+        "property": { "options": options }
+      }))
+      .send()
+      .await
+      .map_err(|err| describe_feishu_request_error("新增飞书标签枚举", err))?;
+    let status = response.status();
+    let body = response
+      .text()
+      .await
+      .map_err(|err| format!("read response failed: {err}"))?;
+
+    if !status.is_success() {
+      if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        if let Some(code) = value.get("code").and_then(Value::as_i64) {
+          if is_token_invalid_code(code as i32) && attempt == 0 {
+            continue;
+          }
+        }
+      }
+      return Err(format!(
+        "新增飞书标签枚举失败：{}。请确认应用已开通更新多维表格字段权限",
+        build_feishu_http_error(status, &body)
+      ));
+    }
+
+    let parsed: Value =
+      serde_json::from_str(&body).map_err(|err| format!("invalid response: {err}"))?;
+    let code = parsed.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 {
+      if is_token_invalid_code(code as i32) && attempt == 0 {
+        continue;
+      }
+      return Err(format!(
+        "新增飞书标签枚举失败：code={} {}。请确认应用已开通更新多维表格字段权限",
+        code,
+        parsed.get("msg").map(value_to_display_string).unwrap_or_default()
+      ));
+    }
+
+    if let Some(updated) = parsed
+      .get("data")
+      .and_then(|data| data.get("field"))
+      .and_then(parse_feishu_field_payload)
+    {
+      return Ok(updated);
+    }
+    return feishu_list_fields(app)
+      .await?
+      .into_iter()
+      .find(|candidate| candidate.field_name == field_name)
+      .ok_or_else(|| format!("新增标签后无法重新读取飞书字段：{}", field_name));
+  }
+
+  Err("刷新 token 后仍无法新增飞书标签枚举".to_string())
+}
+
+async fn feishu_prepare_tag_value(
+  app: &AppHandle,
+  write_fields: &mut Vec<FeishuFieldPayload>,
+  field_name: &str,
+  raw_tags: &str,
+) -> Result<Value, String> {
+  let tags = normalize_tag_values(raw_tags);
+  let field = feishu_tag_field(write_fields, field_name)
+    .cloned()
+    .ok_or_else(|| format!("未能创建或找到飞书标签字段：{}", field_name))?;
+  let resolved = if field.field_type == 4 && !tags.is_empty() {
+    feishu_ensure_multi_select_options(app, field_name, &tags).await?
+  } else {
+    field
+  };
+
+  if let Some(existing) = write_fields
+    .iter_mut()
+    .find(|candidate| candidate.field_name == field_name)
+  {
+    *existing = resolved.clone();
+  }
+  local_tags_to_feishu_value(raw_tags, resolved.field_type)
+}
+
 async fn feishu_prepare_write_fields(app: &AppHandle, ensure_tags: bool) -> Result<Vec<FeishuFieldPayload>, String> {
   let config = load_app_config_from_file(app)?;
   let mut fields = feishu_list_fields(app).await?;
@@ -2118,9 +2343,11 @@ async fn feishu_prepare_write_fields(app: &AppHandle, ensure_tags: bool) -> Resu
     if config.feishu.tag_field_name.trim().is_empty() {
       feishu_create_text_field(app, &tag_field_name).await?;
       fields.push(FeishuFieldPayload {
+        field_id: String::new(),
         field_name: tag_field_name,
         field_type: 1,
         options: Vec::new(),
+        option_details: Vec::new(),
       });
     } else {
       return Err(format!("已绑定的标签字段不存在：{}", tag_field_name));
@@ -2145,7 +2372,7 @@ async fn feishu_create_record(app: &AppHandle, task: &Task) -> Result<String, St
     .map_err(|err| format!("http client init failed: {err}"))?;
 
   let should_sync_tags = !normalize_tag_values(&task.tags).is_empty();
-  let write_fields = match feishu_prepare_write_fields(app, should_sync_tags).await {
+  let mut write_fields = match feishu_prepare_write_fields(app, should_sync_tags).await {
     Ok(fields) => fields,
     Err(err) if should_sync_tags => return Err(err),
     Err(err) => {
@@ -2153,9 +2380,14 @@ async fn feishu_create_record(app: &AppHandle, task: &Task) -> Result<String, St
       Vec::new()
     }
   };
-  let field_names = feishu_field_names(&write_fields);
   let priority_field_name = configured_priority_field_name(&config.feishu).to_string();
   let tag_field_name = configured_tag_field_name(&config.feishu).to_string();
+  let tag_value = if should_sync_tags {
+    Some(feishu_prepare_tag_value(app, &mut write_fields, &tag_field_name, &task.tags).await?)
+  } else {
+    None
+  };
+  let field_names = feishu_field_names(&write_fields);
   let mut fields = json!({
     "任务名称": task.name,
     "状态": task.status,
@@ -2170,16 +2402,13 @@ async fn feishu_create_record(app: &AppHandle, task: &Task) -> Result<String, St
   if !task.notes.trim().is_empty() {
     insert_feishu_field_if_exists(&mut fields, &field_names, "备注/收获", Value::String(task.notes.clone()));
   }
-  let tags = normalize_tag_values(&task.tags);
-  if !tags.is_empty() {
-    if let Some(tag_field) = feishu_tag_field(&write_fields, &tag_field_name) {
-      insert_feishu_field_if_exists(
-        &mut fields,
-        &field_names,
-        &tag_field_name,
-        local_tags_to_feishu_value(&task.tags, tag_field.field_type)?,
-      );
-    }
+  if let Some(tag_value) = tag_value {
+    insert_feishu_field_if_exists(
+      &mut fields,
+      &field_names,
+      &tag_field_name,
+      tag_value,
+    );
   }
 
   let mut force_refresh = false;
@@ -3438,7 +3667,11 @@ fn register_quick_capture_shortcut(
   Ok(())
 }
 
-fn set_window_mode_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
+fn set_window_mode_internal_with_variant(
+  app: &AppHandle,
+  mode: &str,
+  focus_mini_width: Option<f64>,
+) -> Result<(), String> {
   let normalized_mode = normalize_window_mode(mode);
   let window = get_main_window(app)?;
   let ui_state = app.state::<Mutex<UiState>>();
@@ -3447,7 +3680,11 @@ fn set_window_mode_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
     .map_err(|_| "failed to lock ui state".to_string())?;
 
   if normalized_mode == "cat" {
-    apply_mini_mode(app, &window).map_err(|err| err.to_string())?;
+    if let Some(width) = focus_mini_width {
+      apply_focus_mini_mode(&window, width).map_err(|err| err.to_string())?;
+    } else {
+      apply_mini_mode(app, &window).map_err(|err| err.to_string())?;
+    }
     state.mini_mode = true;
   } else {
     apply_normal_mode(&window).map_err(|err| err.to_string())?;
@@ -3463,6 +3700,7 @@ fn set_window_mode_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
   let payload = WindowModeChangedPayload {
     mode: normalized_mode.clone(),
     mini_mode: state.mini_mode,
+    focus_mini: normalized_mode == "cat" && focus_mini_width.is_some(),
   };
   drop(state);
   let _ = app.emit("window-mode-changed", payload);
@@ -3470,6 +3708,10 @@ fn set_window_mode_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
   cfg.pet.window_mode = normalized_mode;
   save_app_config_to_file(app, &cfg)?;
   Ok(())
+}
+
+fn set_window_mode_internal(app: &AppHandle, mode: &str) -> Result<(), String> {
+  set_window_mode_internal_with_variant(app, mode, None)
 }
 
 fn init_global_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -4224,6 +4466,11 @@ fn set_window_mode(app: AppHandle, mode: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_focus_mini_mode(app: AppHandle, width: f64) -> Result<(), String> {
+  set_window_mode_internal_with_variant(&app, "cat", Some(width))
+}
+
+#[tauri::command]
 fn get_pet_settings(app: AppHandle) -> Result<PetSettingsPayload, String> {
   let cfg = load_app_config_from_file(&app)?;
   Ok(PetSettingsPayload {
@@ -4556,12 +4803,11 @@ async fn update_task(
     ),
     "标签" => {
       let tag_field_name = configured_tag_field_name(&config.feishu).to_string();
-      let write_fields = feishu_prepare_write_fields(&app, true).await?;
-      let tag_field = feishu_tag_field(&write_fields, &tag_field_name)
-        .ok_or_else(|| format!("未能创建或找到飞书标签字段：{}", tag_field_name))?;
+      let mut write_fields = feishu_prepare_write_fields(&app, true).await?;
+      let tag_value = feishu_prepare_tag_value(&app, &mut write_fields, &tag_field_name, &value).await?;
       (
         tag_field_name,
-        local_tags_to_feishu_value(&value, tag_field.field_type)?,
+        tag_value,
       )
     }
     _ => (field_name.trim().to_string(), Value::String(value.clone())),
@@ -4611,7 +4857,7 @@ async fn sync_task_tags(
 
   let config = load_app_config_from_file(&app)?;
   let tag_field_name = configured_tag_field_name(&config.feishu).to_string();
-  let write_fields = match feishu_prepare_write_fields(&app, true).await {
+  let mut write_fields = match feishu_prepare_write_fields(&app, true).await {
     Ok(fields) => fields,
     Err(err) => {
       return Ok(UpdateTaskResult {
@@ -4620,15 +4866,8 @@ async fn sync_task_tags(
       })
     }
   };
-  let Some(tag_field) = feishu_tag_field(&write_fields, &tag_field_name) else {
-    return Ok(UpdateTaskResult {
-      success: false,
-      message: format!("未能创建或找到飞书标签字段：{}", tag_field_name),
-    });
-  };
-
   let mut fields = serde_json::Map::new();
-  let tag_value = match local_tags_to_feishu_value(&tags, tag_field.field_type) {
+  let tag_value = match feishu_prepare_tag_value(&app, &mut write_fields, &tag_field_name, &tags).await {
     Ok(value) => value,
     Err(err) => {
       return Ok(UpdateTaskResult {
@@ -4785,7 +5024,7 @@ async fn sync_tasks(
     let tag_field_name = configured_tag_field_name(&config.feishu).to_string();
     let should_sync_tags = !normalize_tag_values(&task.tags).is_empty()
       || !config.feishu.tag_field_name.trim().is_empty();
-    let write_fields = match feishu_prepare_write_fields(&app, should_sync_tags).await {
+    let mut write_fields = match feishu_prepare_write_fields(&app, should_sync_tags).await {
       Ok(fields) => fields,
       Err(err) if should_sync_tags => {
         let retryable = !is_non_retryable_sync_error(&err);
@@ -4796,6 +5035,17 @@ async fn sync_tasks(
         eprintln!("[Rust] list feishu fields failed during sync, use core fields only: {}", err);
         Vec::new()
       }
+    };
+    let tag_value = if feishu_tag_field(&write_fields, &tag_field_name).is_some() {
+      match feishu_prepare_tag_value(&app, &mut write_fields, &tag_field_name, &task.tags).await {
+        Ok(value) => Some(value),
+        Err(err) => {
+          let _ = db_mark_push_result(app.clone(), task.record_id.clone(), err, false).await;
+          continue;
+        }
+      }
+    } else {
+      None
     };
     let field_names = feishu_field_names(&write_fields);
 
@@ -4813,19 +5063,13 @@ async fn sync_tasks(
     if !task.notes.trim().is_empty() {
       insert_feishu_field_if_exists(&mut fields, &field_names, "备注/收获", Value::String(task.notes.clone()));
     }
-    if let Some(tag_field) = feishu_tag_field(&write_fields, &tag_field_name) {
-      match local_tags_to_feishu_value(&task.tags, tag_field.field_type) {
-        Ok(tag_value) => insert_feishu_field_if_exists(
-          &mut fields,
-          &field_names,
-          &tag_field_name,
-          tag_value,
-        ),
-        Err(err) => {
-          let _ = db_mark_push_result(app.clone(), task.record_id.clone(), err, false).await;
-          continue;
-        }
-      }
+    if let Some(tag_value) = tag_value {
+      insert_feishu_field_if_exists(
+        &mut fields,
+        &field_names,
+        &tag_field_name,
+        tag_value,
+      );
     }
 
     match feishu_update_record_fields(&app, &task.record_id, fields).await {
@@ -4918,6 +5162,7 @@ pub fn run() {
       get_system_settings,
       save_system_settings,
       set_window_mode,
+      set_focus_mini_mode,
       get_pet_settings,
       save_pet_settings,
       get_app_mode,
@@ -5062,6 +5307,30 @@ mod tests {
   }
 
   #[test]
+  fn new_tags_are_appended_without_recreating_existing_feishu_options() {
+    let existing = vec![
+      FeishuFieldOption {
+        id: "opt-existing".to_string(),
+        name: "周报".to_string(),
+        color: Some(2),
+      },
+      FeishuFieldOption {
+        id: "opt-review".to_string(),
+        name: "评审".to_string(),
+        color: Some(5),
+      },
+    ];
+    let desired = vec!["周报".to_string(), "用户体验".to_string()];
+    let (options, missing) = merge_feishu_multi_select_options(&existing, &desired);
+
+    assert_eq!(missing, vec!["用户体验".to_string()]);
+    assert_eq!(options.len(), 3);
+    assert_eq!(options[0], json!({ "id": "opt-existing", "name": "周报", "color": 2 }));
+    assert_eq!(options[1], json!({ "id": "opt-review", "name": "评审", "color": 5 }));
+    assert_eq!(options[2], json!({ "name": "用户体验" }));
+  }
+
+  #[test]
   fn legacy_tags_remain_text() {
     assert_eq!(
       local_tags_to_feishu_value(r#"["需求","oncall"]"#, 1),
@@ -5105,6 +5374,27 @@ mod tests {
       )
       .expect("read preserved tags");
     assert_eq!(preserved, r#"["保留标签"]"#);
+  }
+
+  #[test]
+  fn remote_empty_tags_do_not_overwrite_pending_local_tags() {
+    let conn = Connection::open_in_memory().expect("open test db");
+    create_test_tasks_table(&conn);
+
+    let mut local = test_task("record-pending", r#"["新标签"]"#);
+    local.sync_status = "pending".to_string();
+    upsert_task(&conn, &local).expect("seed pending local tags");
+
+    let remote = test_task("record-pending", "[]");
+    upsert_task(&conn, &remote).expect("merge empty remote tags");
+    let tags: String = conn
+      .query_row(
+        "SELECT tags FROM tasks WHERE record_id = 'record-pending'",
+        [],
+        |row| row.get(0),
+      )
+      .expect("read pending tags");
+    assert_eq!(tags, r#"["新标签"]"#);
   }
 
   #[test]

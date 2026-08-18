@@ -110,6 +110,7 @@
             @focus="setFocusedTask"
             @request-delete="emit('request-delete', $event)"
             @completed="emit('task-completed', $event)"
+            @start-focus="emit('start-focus', $event)"
           />
         </div>
         <div
@@ -169,6 +170,7 @@ const emit = defineEmits<{
   (event: 'create-template', template: QuickTaskTemplate): void;
   (event: 'create-habit-template'): void;
   (event: 'task-completed', payload: { recordId: string; name: string; x: number; y: number }): void;
+  (event: 'start-focus', task: Task): void;
 }>();
 
 const store = useTaskStore();
@@ -403,6 +405,12 @@ async function openTask(recordId: string) {
   focusedTaskId.value = recordId;
   await nextTick();
   itemRefs.get(recordId)?.openFromReminder?.();
+}
+
+async function revealTask(recordId: string) {
+  focusedTaskId.value = recordId;
+  await nextTick();
+  itemRefs.get(recordId)?.revealFromFocus?.();
 }
 
 function canDropInGroup(group: TaskGroup): boolean {
@@ -749,6 +757,7 @@ defineExpose({
   toggleFocusedStatus,
   requestDeleteFocused,
   openTask,
+  revealTask,
   clearFocus,
   hasTasks
 });

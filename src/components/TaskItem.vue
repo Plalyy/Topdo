@@ -125,6 +125,9 @@
         class="task-context-menu"
         :style="{ left: `${menuX}px`, top: `${menuY}px` }"
       >
+        <button v-if="!completed" type="button" class="menu-item" @click.stop="onContextFocus">
+          聚焦此任务
+        </button>
         <button type="button" class="menu-item danger" @click.stop="onContextDelete">
           删除任务
         </button>
@@ -166,6 +169,15 @@
             />
             <div class="input-divider" aria-hidden="true"></div>
           </div>
+
+          <button v-if="!completed" type="button" class="detail-focus-entry" @click="onStartFocus">
+            <span class="detail-option-icon detail-option-icon--blue"><Icon name="target" :size="17" /></span>
+            <span>
+              <strong>聚焦此任务</strong>
+              <small>缩成胶囊，只保留当前任务</small>
+            </span>
+            <Icon name="chevron-right" :size="15" />
+          </button>
 
           <section class="detail-option-row detail-option-row--stack" @click="startDateEdit">
             <div class="detail-option-icon detail-option-icon--green"><Icon name="calendar" :size="17" /></div>
@@ -351,6 +363,7 @@ const emit = defineEmits<{
   (event: 'request-delete', task: Task): void;
   (event: 'focus', recordId: string): void;
   (event: 'completed', payload: { recordId: string; name: string; x: number; y: number }): void;
+  (event: 'start-focus', task: Task): void;
 }>();
 
 const store = useTaskStore();
@@ -1044,6 +1057,16 @@ function onContextDelete() {
   emit('request-delete', props.task);
 }
 
+function onContextFocus() {
+  closeContextMenu();
+  onStartFocus();
+}
+
+function onStartFocus() {
+  expanded.value = false;
+  emit('start-focus', props.task);
+}
+
 function handleBack() {
   expanded.value = false;
 }
@@ -1126,11 +1149,19 @@ function openFromReminder() {
   });
 }
 
+function revealFromFocus() {
+  emit('focus', props.task.record_id);
+  void nextTick(() => {
+    taskItemRootRef.value?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
+}
+
 defineExpose({
   toggleExpandFromKeyboard,
   toggleStatusFromKeyboard,
   requestDeleteFromKeyboard,
-  openFromReminder
+  openFromReminder,
+  revealFromFocus
 });
 </script>
 
@@ -1608,6 +1639,43 @@ defineExpose({
 
 .menu-item.danger {
   color: var(--accent-red);
+}
+
+.detail-focus-entry {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 8px;
+  padding: 9px 10px;
+  border: 0.5px solid color-mix(in srgb, var(--primary) 20%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--primary) 5%, var(--bg-solid));
+  color: var(--text-tertiary);
+  text-align: left;
+}
+
+.detail-focus-entry > span:nth-child(2) {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.detail-focus-entry strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.detail-focus-entry small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.detail-focus-entry:hover {
+  border-color: color-mix(in srgb, var(--primary) 46%, var(--border));
+  background: color-mix(in srgb, var(--primary) 8%, var(--bg-solid));
 }
 
 .context-menu-enter-active,

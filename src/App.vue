@@ -4,16 +4,22 @@
       <div
         v-if="isMiniMode"
         class="mini-shell"
-        :class="{ pressed: miniPressed, dragging: miniDragging }"
+        :class="{ pressed: miniPressed, dragging: miniDragging, 'mini-shell--focus': focusedTask }"
         @mousedown="onMiniMouseDown"
       >
         <CatPet v-if="showMiniPet" :show-badge="petStore.showBadge" :animations="petStore.animations" />
-        <button v-else type="button" class="mini-pill" @click.stop.prevent>
-          <span class="mini-pill__brand">Topdo</span>
-          <span class="mini-pill__meta">
-            <span class="mini-pill__count">{{ taskStore.todoCount }}</span>
-            <span class="mini-pill__label">待办</span>
-          </span>
+        <button v-else type="button" class="mini-pill" :class="{ 'mini-pill--focus': focusedTask }" @click.stop.prevent>
+          <template v-if="focusedTask">
+            <span class="mini-pill__focus-dot"></span>
+            <span class="mini-pill__focus-name" :title="focusedTask.name">{{ focusedTask.name }}</span>
+          </template>
+          <template v-else>
+            <span class="mini-pill__brand">Topdo</span>
+            <span class="mini-pill__meta">
+              <span class="mini-pill__count">{{ taskStore.todoCount }}</span>
+              <span class="mini-pill__label">待办</span>
+            </span>
+          </template>
         </button>
       </div>
 
@@ -87,6 +93,7 @@
             @error="showError"
             @request-delete="openDeleteDialog"
             @task-completed="onTaskCompleted"
+            @start-focus="startFocus"
           />
 
           <div v-if="firstReminderNudge" class="first-reminder-nudge">
@@ -242,6 +249,7 @@ import TitleBar from './components/TitleBar.vue';
 import Welcome from './components/Welcome.vue';
 import HabitView from './views/HabitView.vue';
 import { useAppStore } from './stores/appStore';
+import { useFocusStore } from './stores/focusStore';
 import { useHabitStore } from './stores/habitStore';
 import { usePetStore } from './stores/petStore';
 import { useTaskStore } from './stores/taskStore';
@@ -268,6 +276,7 @@ interface WindowSizePayload {
 interface WindowModeChangedPayload {
   mode: 'panel' | 'cat';
   mini_mode: boolean;
+  focus_mini?: boolean;
 }
 
 interface QuickTaskTemplate {
@@ -311,6 +320,7 @@ interface CompletionBurst {
 
 const taskStore = useTaskStore();
 const appStore = useAppStore();
+const focusStore = useFocusStore();
 const habitStore = useHabitStore();
 const petStore = usePetStore();
 const appWindow = getCurrentWindow();
@@ -344,6 +354,8 @@ let unlistenWindowModeChanged: UnlistenFn | null = null;
 let unlistenFocusChanged: (() => void) | null = null;
 let unlistenTasksUpdated: UnlistenFn | null = null;
 let initialTraitsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let applyingFocusMiniMode = false;
+let focusMeasureCanvas: HTMLCanvasElement | null = null;
 
 const deleteDialogVisible = ref(false);
 const pendingDeleteTask = ref<Task | null>(null);
@@ -356,7 +368,8 @@ const FIRST_REMINDER_NUDGE_KEY = 'topdo_first_reminder_nudge_seen_v1';
 const onboardingPendingFromFirstLaunch = ref(false);
 const showOnboarding = ref(false);
 const firstReminderNudge = ref<CreatedTaskPayload | null>(null);
-const showMiniPet = computed(() => isMiniMode.value && petStore.enabled);
+const showMiniPet = computed(() => isMiniMode.value && petStore.enabled && !focusStore.hasActive);
+const focusedTask = computed(() => taskStore.tasks.find((task) => task.record_id === focusStore.currentTaskId) || null);
 const searchQueryLabel = computed(() => taskStore.searchQuery.trim());
 const searchResultCount = computed(() => taskStore.filteredTasks.length);
 const pendingDeleteIsRecurringInstance = computed(() => Boolean(pendingDeleteTask.value?.recurrence_parent_id));
@@ -494,6 +507,31 @@ function onTaskCompleted(payload: CompletionPayload) {
       showCompletionClearToast();
     }
   });
+}
+
+function isCompletedStatus(status: string) {
+  return status.includes('已完成');
+}
+
+function isInProgressStatus(status: string) {
+  return status.includes('进行中');
+}
+
+async function startFocus(task: Task) {
+  if (!task.record_id || isCompletedStatus(task.status)) return;
+  appStore.switchMode('tasks');
+  currentView.value = 'main';
+  closeCreateTask();
+  taskStore.closeSearch();
+  shortcutSheetVisible.value = false;
+  focusStore.begin(task.record_id);
+
+  if (!isInProgressStatus(task.status)) {
+    void taskStore.updateTaskStatus(task.record_id, '进行中').catch((error) => {
+      showError(`开始任务失败：${String(error)}`);
+    });
+  }
+  await onEnterMiniMode();
 }
 
 async function openReminderToast(reminder: InAppReminder) {
@@ -721,22 +759,65 @@ async function onEnterMiniMode() {
     shortcutSheetVisible.value = false;
     isMiniMode.value = true;
     petStore.windowMode = WindowMode.Cat;
-    await invoke('set_window_mode', { mode: 'cat' });
+    if (focusStore.hasActive) {
+      await ensureFocusMiniMode();
+    } else {
+      await invoke('set_window_mode', { mode: 'cat' });
+    }
     await petStore.save();
     await applyPetPosition();
   } catch (error) {
+    await invoke('set_window_mode', { mode: 'panel' }).catch(() => undefined);
     isMiniMode.value = false;
     petStore.windowMode = WindowMode.Panel;
+    if (focusStore.hasActive) focusStore.clear();
     showError(String(error));
   }
 }
 
+async function ensureFocusMiniMode() {
+  if (applyingFocusMiniMode) return;
+  applyingFocusMiniMode = true;
+  try {
+    const title = focusedTask.value?.name || '';
+    focusMeasureCanvas ||= document.createElement('canvas');
+    const context = focusMeasureCanvas.getContext('2d');
+    const fontFamily = getComputedStyle(document.documentElement)
+      .getPropertyValue('--font-family')
+      .trim() || '-apple-system, BlinkMacSystemFont, sans-serif';
+    let titleWidth = 0;
+    if (context) {
+      context.font = `600 12px ${fontFamily}`;
+      titleWidth = context.measureText(title).width;
+    } else {
+      titleWidth = Array.from(title).reduce(
+        (total, character) => total + (/[^\x00-\xff]/.test(character) ? 12 : 7),
+        0
+      );
+    }
+    const width = Math.min(320, Math.max(120, Math.ceil(48 + titleWidth)));
+    await invoke('set_focus_mini_mode', { width });
+  } finally {
+    applyingFocusMiniMode = false;
+  }
+}
+
 async function restoreNormalMode() {
+  const focusTask = focusedTask.value;
   try {
     await invoke('set_window_mode', { mode: 'panel' });
     isMiniMode.value = false;
     petStore.windowMode = WindowMode.Panel;
     await petStore.save();
+    if (focusTask) {
+      currentView.value = 'main';
+      appStore.switchMode('tasks');
+      taskStore.clearSearch();
+      taskStore.setFilter(isInProgressStatus(focusTask.status) ? 'in_progress' : 'pending');
+      focusStore.clear();
+      await nextTick();
+      taskListRef.value?.revealTask?.(focusTask.record_id);
+    }
   } catch (error) {
     showError(String(error));
   }
@@ -1126,6 +1207,7 @@ function onGlobalKeydown(event: KeyboardEvent) {
 onMounted(async () => {
   initializeTheme();
   appStore.load();
+  focusStore.load();
   await habitStore.fetchHabits().catch((error) => showError(String(error)));
   await petStore.load().catch(() => undefined);
   await syncWindowState();
@@ -1135,7 +1217,13 @@ onMounted(async () => {
     petStore.windowMode = payload.mode === 'cat' ? WindowMode.Cat : WindowMode.Panel;
     void petStore.save();
     if (payload.mode === 'cat') {
-      void applyPetPosition();
+      if (focusStore.hasActive && !payload.focus_mini) {
+        void ensureFocusMiniMode()
+          .catch((error) => console.warn('应用聚焦胶囊尺寸失败:', error))
+          .then(() => applyPetPosition());
+      } else {
+        void applyPetPosition();
+      }
     }
   });
   unlistenTasksUpdated = await listen('tasks-updated', () => {
@@ -1178,7 +1266,12 @@ onMounted(async () => {
   });
 
   await bootstrap();
-  if (petStore.enabled && (isMiniMode.value || petStore.windowMode === WindowMode.Cat)) {
+  if (focusStore.hasActive && focusedTask.value) {
+    isMiniMode.value = true;
+    petStore.windowMode = WindowMode.Cat;
+    await ensureFocusMiniMode();
+    await applyPetPosition();
+  } else if (petStore.enabled && (isMiniMode.value || petStore.windowMode === WindowMode.Cat)) {
     isMiniMode.value = true;
     petStore.windowMode = WindowMode.Cat;
     await applyPetPosition();
@@ -1256,11 +1349,33 @@ watch(
 );
 
 watch(
+  () => taskStore.tasks.map((task) => task.record_id),
+  () => {
+    if (!focusStore.hasActive || taskStore.loading) return;
+    if (focusedTask.value) return;
+    focusStore.clear();
+  }
+);
+
+watch(
   () => petStore.enabled,
   () => {
     if (!isMiniMode.value) return;
-    void invoke('set_window_mode', { mode: 'cat' }).catch((error) => {
+    const command = focusStore.hasActive
+      ? ensureFocusMiniMode()
+      : invoke('set_window_mode', { mode: 'cat' });
+    void command.catch((error) => {
       showError(String(error));
+    });
+  }
+);
+
+watch(
+  () => focusedTask.value?.name,
+  () => {
+    if (!isMiniMode.value || !focusStore.hasActive) return;
+    void ensureFocusMiniMode().catch((error) => {
+      console.warn('更新聚焦胶囊尺寸失败:', error);
     });
   }
 );
@@ -1423,6 +1538,38 @@ watch(
 .mini-pill__label {
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.mini-pill--focus {
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 12px;
+}
+
+.mini-shell--focus {
+  padding: 4px;
+}
+
+.mini-pill__focus-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--status-done, #20bf63);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-done, #20bf63) 13%, transparent);
+}
+
+.mini-pill__focus-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.3;
+  font-weight: 600;
+  text-align: left;
 }
 
 .mini-shell.pressed {
