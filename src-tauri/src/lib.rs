@@ -39,6 +39,8 @@ const FOCUS_MINI_MIN_WIDTH: f64 = 120.0;
 const FOCUS_MINI_MAX_WIDTH: f64 = 320.0;
 const FOCUS_MINI_HEIGHT: f64 = 44.0;
 const TOP_DOCK_COLLAPSED_HEIGHT: f64 = 12.0;
+const TOP_DOCK_SNAP_DISTANCE: i32 = 24;
+const TOP_DOCK_DETACH_DISTANCE: i32 = 56;
 const CONFIG_FILE_NAME: &str = "config.json";
 const DB_FILE_NAME: &str = "tasks.db";
 const TASK_ORDER_FILE_NAME: &str = "task_order.json";
@@ -135,7 +137,7 @@ struct UiState {
   top_dock_restore_height: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct WindowStatePayload {
   mini_mode: bool,
   always_on_top: bool,
@@ -1122,6 +1124,23 @@ fn apply_top_dock_size(window: &WebviewWindow, width: f64) -> tauri::Result<()> 
   window.set_min_size(Some(size))?;
   window.set_max_size(Some(size))?;
   Ok(())
+}
+
+fn current_monitor_top(window: &WebviewWindow) -> Result<i32, String> {
+  let monitor = window
+    .current_monitor()
+    .map_err(|err| format!("get current monitor failed: {err}"))?
+    .or_else(|| window.primary_monitor().ok().flatten())
+    .ok_or_else(|| "current monitor unavailable".to_string())?;
+  Ok(monitor.work_area().position.y)
+}
+
+fn window_top_distance(window: &WebviewWindow) -> Result<(PhysicalPosition<i32>, i32), String> {
+  let position = window
+    .outer_position()
+    .map_err(|err| format!("get window position failed: {err}"))?;
+  let monitor_top = current_monitor_top(window)?;
+  Ok((position, position.y - monitor_top))
 }
 
 fn apply_mini_mode(app: &AppHandle, window: &WebviewWindow) -> tauri::Result<()> {
@@ -3990,8 +4009,6 @@ fn set_top_dock_mode(
   mode: String,
   width: f64,
   height: f64,
-  x: i32,
-  y: i32,
 ) -> Result<WindowStatePayload, String> {
   let window = get_main_window(&app)?;
   let mut state = state
@@ -4010,15 +4027,19 @@ fn set_top_dock_mode(
 
   match mode.trim() {
     "collapsed" => {
+      let (position, _) = window_top_distance(&window)?;
+      let monitor_top = current_monitor_top(&window)?;
       state.top_docked = true;
       state.top_dock_collapsed = true;
       apply_top_dock_size(&window, state.top_dock_restore_width)
         .map_err(|err| err.to_string())?;
       window
-        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .set_position(Position::Physical(PhysicalPosition::new(position.x, monitor_top)))
         .map_err(|err| err.to_string())?;
     }
     "expanded" => {
+      let (position, _) = window_top_distance(&window)?;
+      let monitor_top = current_monitor_top(&window)?;
       state.top_docked = true;
       state.top_dock_collapsed = false;
       apply_panel_constraints(&window).map_err(|err| err.to_string())?;
@@ -4029,7 +4050,7 @@ fn set_top_dock_mode(
         )))
         .map_err(|err| err.to_string())?;
       window
-        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .set_position(Position::Physical(PhysicalPosition::new(position.x, monitor_top)))
         .map_err(|err| err.to_string())?;
     }
     "off" => {
@@ -4059,6 +4080,68 @@ fn set_top_dock_mode(
     top_docked: state.top_docked,
     top_dock_collapsed: state.top_dock_collapsed,
   })
+}
+
+fn reconcile_top_dock_window(
+  window: &WebviewWindow,
+  state: &mut UiState,
+) -> Result<(WindowStatePayload, bool), String> {
+  let (position, distance_from_top) = window_top_distance(window)?;
+  let mut changed = false;
+
+  if !state.mini_mode && !state.top_docked && distance_from_top <= TOP_DOCK_SNAP_DISTANCE {
+    let size = window
+      .outer_size()
+      .map_err(|err| format!("get window size failed: {err}"))?;
+    let scale_factor = window
+      .scale_factor()
+      .map_err(|err| format!("get scale factor failed: {err}"))?;
+    state.top_dock_restore_width = (size.width as f64 / scale_factor).max(NORMAL_MIN_WIDTH);
+    state.top_dock_restore_height = (size.height as f64 / scale_factor).max(NORMAL_MIN_HEIGHT);
+    state.top_docked = true;
+    state.top_dock_collapsed = true;
+    apply_top_dock_size(window, state.top_dock_restore_width).map_err(|err| err.to_string())?;
+    let monitor_top = current_monitor_top(window)?;
+    window
+      .set_position(Position::Physical(PhysicalPosition::new(position.x, monitor_top)))
+      .map_err(|err| err.to_string())?;
+    changed = true;
+  } else if !state.mini_mode
+    && state.top_docked
+    && !state.top_dock_collapsed
+    && distance_from_top > TOP_DOCK_DETACH_DISTANCE
+  {
+    state.top_docked = false;
+    apply_panel_constraints(window).map_err(|err| err.to_string())?;
+    changed = true;
+  }
+
+  Ok((
+    WindowStatePayload {
+      mini_mode: state.mini_mode,
+      always_on_top: state.always_on_top,
+      top_docked: state.top_docked,
+      top_dock_collapsed: state.top_dock_collapsed,
+    },
+    changed,
+  ))
+}
+
+#[tauri::command]
+fn reconcile_top_dock(
+  app: AppHandle,
+  state: State<'_, Mutex<UiState>>,
+) -> Result<WindowStatePayload, String> {
+  let window = get_main_window(&app)?;
+  let mut state = state
+    .lock()
+    .map_err(|_| "failed to lock ui state".to_string())?;
+  let (payload, changed) = reconcile_top_dock_window(&window, &mut state)?;
+  drop(state);
+  if changed {
+    let _ = app.emit("top-dock-state-changed", payload.clone());
+  }
+  Ok(payload)
 }
 
 #[tauri::command]
@@ -5325,8 +5408,11 @@ pub fn run() {
       Ok(())
     })
     .on_window_event(|window, event| {
-      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        if window.label() == MAIN_WINDOW_LABEL {
+      if window.label() != MAIN_WINDOW_LABEL {
+        return;
+      }
+      match event {
+        tauri::WindowEvent::CloseRequested { api, .. } => {
           let should_hide = load_app_config_from_file(window.app_handle())
             .map(|cfg| cfg.system.close_to_menu_bar)
             .unwrap_or(true);
@@ -5335,12 +5421,31 @@ pub fn run() {
             let _ = window.hide();
           }
         }
+        tauri::WindowEvent::Moved(_) => {
+          let app = window.app_handle();
+          if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+            let state = app.state::<Mutex<UiState>>();
+            let reconciliation = match state.try_lock() {
+              Ok(mut state) => reconcile_top_dock_window(&main_window, &mut state),
+              Err(_) => return,
+            };
+            match reconciliation {
+              Ok((payload, true)) => {
+                let _ = app.emit("top-dock-state-changed", payload);
+              }
+              Ok((_, false)) => {}
+              Err(err) => eprintln!("[Rust] reconcile top dock after move failed: {err}"),
+            }
+          }
+        }
+        _ => {}
       }
     })
     .invoke_handler(tauri::generate_handler![
       check_feishu_api_client,
       get_window_state,
       set_top_dock_mode,
+      reconcile_top_dock,
       reapply_window_traits,
       toggle_always_on_top,
       enter_mini_mode,

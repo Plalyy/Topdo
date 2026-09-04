@@ -1,8 +1,8 @@
 <template>
   <header
-    data-tauri-drag-region
     class="title-bar"
     :class="{ inactive: !windowFocused }"
+    @mousedown="onDragMouseDown"
     @dblclick="onDoubleClick"
   >
     <div
@@ -92,6 +92,7 @@
 </template>
 
 <script setup lang="ts">
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import ModeDropdown from './ModeDropdown.vue';
 
@@ -106,8 +107,10 @@ const emit = defineEmits<{
   (event: 'toggle-theme'): void;
   (event: 'mini'): void;
   (event: 'close-to-tray'): void;
+  (event: 'drag-end'): void;
 }>();
 
+const appWindow = getCurrentWindow();
 const trafficHover = ref(false);
 const windowFocused = ref(true);
 
@@ -124,6 +127,19 @@ function onDoubleClick(event: MouseEvent) {
     return;
   }
   emit('mini');
+}
+
+async function onDragMouseDown(event: MouseEvent) {
+  if (event.button !== 0) return;
+  if (event.target instanceof HTMLElement && event.target.closest('[data-no-drag]')) {
+    return;
+  }
+  event.preventDefault();
+  try {
+    await appWindow.startDragging();
+  } finally {
+    emit('drag-end');
+  }
 }
 
 function handleGreen() {
@@ -230,7 +246,6 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
   letter-spacing: -0.01em;
   user-select: none;
-  -webkit-app-region: no-drag;
 }
 
 .titlebar-actions {

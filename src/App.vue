@@ -50,6 +50,7 @@
           @toggle-theme="onToggleTheme"
           @mini="onEnterMiniMode"
           @close-to-tray="onHideToTray"
+          @drag-end="reconcileTopDock"
         />
 
         <section v-if="currentView === 'welcome'" class="min-h-0 flex-1">
@@ -251,7 +252,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { LogicalSize, PhysicalPosition } from '@tauri-apps/api/dpi';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
-import { currentMonitor, getCurrentWindow } from '@tauri-apps/api/window';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import ConfirmDialog from './components/ConfirmDialog.vue';
 import CatPet from './components/CatPet/CatPet.vue';
@@ -363,9 +364,7 @@ let miniMouseMoveHandler: ((event: MouseEvent) => void) | null = null;
 let miniMouseUpHandler: (() => void) | null = null;
 let miniSuppressClick = false;
 let topDockCollapseTimer: ReturnType<typeof setTimeout> | null = null;
-let topDockMoveTimer: ReturnType<typeof setTimeout> | null = null;
 let topDockTransitioning = false;
-let unlistenMoved: UnlistenFn | null = null;
 
 const toast = ref('');
 const reminderToasts = ref<InAppReminder[]>([]);
@@ -377,6 +376,7 @@ const completionEffectTimers = new Set<ReturnType<typeof setTimeout>>();
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenResized: (() => void) | null = null;
 let unlistenWindowModeChanged: UnlistenFn | null = null;
+let unlistenTopDockStateChanged: UnlistenFn | null = null;
 let unlistenFocusChanged: (() => void) | null = null;
 let unlistenTasksUpdated: UnlistenFn | null = null;
 let initialTraitsRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -973,17 +973,13 @@ function clearTopDockCollapseTimer() {
 }
 
 async function currentPanelMetrics() {
-  const [position, size, scaleFactor, monitor] = await Promise.all([
-    appWindow.outerPosition(),
+  const [size, scaleFactor] = await Promise.all([
     appWindow.outerSize(),
-    appWindow.scaleFactor(),
-    currentMonitor()
+    appWindow.scaleFactor()
   ]);
   return {
-    position,
     width: size.width / scaleFactor,
-    height: size.height / scaleFactor,
-    top: monitor?.workArea.position.y ?? monitor?.position.y ?? 0
+    height: size.height / scaleFactor
   };
 }
 
@@ -995,9 +991,7 @@ async function setTopDockMode(mode: 'collapsed' | 'expanded' | 'off') {
     const state = await invoke<WindowStatePayload>('set_top_dock_mode', {
       mode,
       width: metrics.width,
-      height: metrics.height,
-      x: metrics.position.x,
-      y: metrics.top
+      height: metrics.height
     });
     isTopDocked.value = state.top_docked;
     isTopDockCollapsed.value = state.top_dock_collapsed;
@@ -1015,6 +1009,7 @@ function scheduleTopDockCollapse(delay = 520) {
   if (!isTopDocked.value || isTopDockCollapsed.value || isMiniMode.value) return;
   topDockCollapseTimer = window.setTimeout(() => {
     topDockCollapseTimer = null;
+    if (!isTopDocked.value || isTopDockCollapsed.value || isMiniMode.value) return;
     void setTopDockMode('collapsed');
   }, delay);
 }
@@ -1030,18 +1025,14 @@ function onPanelMouseLeave() {
   scheduleTopDockCollapse();
 }
 
-async function reconcileTopDock(position: PhysicalPosition) {
+async function reconcileTopDock() {
   if (isMiniMode.value || topDockTransitioning) return;
-  const monitor = await currentMonitor();
-  const top = monitor?.workArea.position.y ?? monitor?.position.y ?? 0;
-  const distanceFromTop = position.y - top;
-  if (!isTopDocked.value && distanceFromTop <= 10) {
-    await setTopDockMode('collapsed');
-    return;
-  }
-  if (isTopDocked.value && !isTopDockCollapsed.value && distanceFromTop > 28) {
-    clearTopDockCollapseTimer();
-    await setTopDockMode('off');
+  try {
+    const state = await invoke<WindowStatePayload>('reconcile_top_dock');
+    isTopDocked.value = state.top_docked;
+    isTopDockCollapsed.value = state.top_dock_collapsed;
+  } catch (error) {
+    console.warn('检查顶部吸附失败:', error);
   }
 }
 
@@ -1341,6 +1332,13 @@ onMounted(async () => {
       }
     }
   });
+  unlistenTopDockStateChanged = await listen<WindowStatePayload>('top-dock-state-changed', (event) => {
+    isTopDocked.value = event.payload.top_docked;
+    isTopDockCollapsed.value = event.payload.top_dock_collapsed;
+    if (!event.payload.top_docked) {
+      clearTopDockCollapseTimer();
+    }
+  });
   unlistenTasksUpdated = await listen('tasks-updated', () => {
     void taskStore.fetchTasks().catch((error) => showError(String(error)));
   });
@@ -1372,13 +1370,6 @@ onMounted(async () => {
         console.warn('保存窗口尺寸失败:', error);
       }
     }, 500);
-  });
-  unlistenMoved = await appWindow.onMoved(({ payload: position }) => {
-    if (topDockMoveTimer) clearTimeout(topDockMoveTimer);
-    topDockMoveTimer = window.setTimeout(() => {
-      topDockMoveTimer = null;
-      void reconcileTopDock(position);
-    }, 180);
   });
   unlistenFocusChanged = await appWindow.onFocusChanged(({ payload }) => {
     if (payload) {
@@ -1426,21 +1417,17 @@ onUnmounted(() => {
   document.removeEventListener('keydown', onGlobalKeydown);
   clearMiniDragListeners();
   clearTopDockCollapseTimer();
-  if (topDockMoveTimer) {
-    clearTimeout(topDockMoveTimer);
-    topDockMoveTimer = null;
-  }
   if (unlistenResized) {
     unlistenResized();
     unlistenResized = null;
   }
-  if (unlistenMoved) {
-    unlistenMoved();
-    unlistenMoved = null;
-  }
   if (unlistenWindowModeChanged) {
     unlistenWindowModeChanged();
     unlistenWindowModeChanged = null;
+  }
+  if (unlistenTopDockStateChanged) {
+    unlistenTopDockStateChanged();
+    unlistenTopDockStateChanged = null;
   }
   if (unlistenFocusChanged) {
     unlistenFocusChanged();
