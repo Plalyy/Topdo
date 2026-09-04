@@ -58,16 +58,16 @@ const emit = defineEmits<{
 <style scoped>
 .stats-bar {
   position: relative;
-  padding: 1px 0;
+  padding: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .segmented {
   min-width: 0;
-  height: 28px;
+  height: 25px;
   padding: 2px;
   display: flex;
   align-items: center;
@@ -80,8 +80,8 @@ const emit = defineEmits<{
 .tab-btn {
   flex: 1;
   min-width: 0;
-  height: 24px;
-  padding: 0 8px;
+  height: 21px;
+  padding: 0 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -115,8 +115,8 @@ const emit = defineEmits<{
 }
 
 .add-btn {
-  width: 28px;
-  height: 28px;
+  width: 25px;
+  height: 25px;
   flex-shrink: 0;
   border-radius: 8px;
   border: 0.5px solid color-mix(in srgb, var(--border) 65%, transparent);
@@ -142,7 +142,7 @@ const emit = defineEmits<{
 .stats-summary {
   grid-column: 1 / -1;
   width: 100%;
-  padding: 4px 8px;
+  padding: 2px 7px 1px;
   border: 0;
   border-radius: 8px;
   background: transparent;

@@ -35,6 +35,8 @@ export interface Task {
   recurrence_index?: number | null;
   reminder_before?: number | null;
   reminder_notified?: boolean;
+  agent_host?: string;
+  agent_labels?: string[];
   source?: 'local' | 'feishu' | string;
   feishu_record_id?: string;
   sync_status: string;

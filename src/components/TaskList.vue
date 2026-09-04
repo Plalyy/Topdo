@@ -1,5 +1,5 @@
 <template>
-  <section class="flex min-h-0 flex-1 flex-col px-3 pb-2 pt-0">
+  <section class="flex min-h-0 flex-1 flex-col px-2 pb-1 pt-0">
     <Transition name="create-panel">
       <QuickInput
         v-if="creating"
@@ -891,7 +891,7 @@ onBeforeUnmount(() => {
 
 .task-list {
   flex: 1;
-  padding: 0 0 10px;
+  padding: 0 0 4px;
 }
 
 .task-list.dragging {
@@ -922,9 +922,9 @@ onBeforeUnmount(() => {
 }
 
 .task-group {
-  margin-top: 8px;
+  margin-top: 2px;
   border-radius: var(--radius-card);
-  padding: 1px 0 4px;
+  padding: 0 0 1px;
   transition: background 0.15s ease, outline-color 0.15s ease;
 }
 
@@ -934,15 +934,16 @@ onBeforeUnmount(() => {
 }
 
 .task-group__header {
-  margin: 10px 12px 2px;
-  width: calc(100% - 24px);
+  min-height: 18px;
+  margin: 2px 10px 0;
+  width: calc(100% - 20px);
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border: 0;
   background: transparent;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
   color: var(--text-tertiary);
   font-family: var(--font-family);
@@ -994,16 +995,16 @@ onBeforeUnmount(() => {
 }
 
 .task-draggable :deep(.task-card) {
-  padding-right: 32px;
+  padding-right: 28px;
 }
 
 .task-drag-handle {
   position: absolute;
   top: 50%;
-  right: 10px;
+  right: 7px;
   z-index: 4;
-  width: 28px;
-  height: 32px;
+  width: 24px;
+  height: 28px;
   display: inline-flex;
   flex-direction: column;
   align-items: center;

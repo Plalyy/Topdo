@@ -59,12 +59,12 @@ const lastSyncText = computed(() => {
 
 <style scoped>
 .status-bar {
-  height: 26px;
-  padding: 0 14px;
+  height: 22px;
+  padding: 0 10px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: var(--font-size-sm);
+  font-size: 10px;
   color: var(--text-tertiary);
   border-top: 0.5px solid var(--border-light);
   background: var(--bg-secondary);
@@ -117,14 +117,14 @@ const lastSyncText = computed(() => {
 }
 
 .shortcut-btn {
-  margin-left: 6px;
+  margin-left: 4px;
   border: none;
   background: transparent;
   color: var(--text-tertiary);
   border-radius: 6px;
-  height: 18px;
-  padding: 0 6px;
-  font-size: 10px;
+  height: 16px;
+  padding: 0 4px;
+  font-size: 9px;
   cursor: pointer;
 }
 

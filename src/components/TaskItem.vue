@@ -85,7 +85,11 @@
             <span v-else>{{ segment.text }}</span>
           </template>
         </p>
-        <div v-if="!inlineEditing && (dueDateInfo || recurrenceText || subTaskTotal > 0 || taskTags.length)" class="task-meta-line">
+        <div v-if="!inlineEditing && (dueDateInfo || recurrenceText || subTaskTotal > 0 || taskTags.length || agentBindingText)" class="task-meta-line">
+          <span v-if="agentBindingText" class="agent-binding-chip" :title="agentBindingText">
+            <span class="agent-binding-chip__dot"></span>
+            {{ agentBindingText }}
+          </span>
           <span v-if="recurrenceText" class="badge badge-recurring">
             <Icon name="recurring" :size="11" />
             <span>{{ recurrenceText }}</span>
@@ -242,6 +246,24 @@
           </section>
 
           <section class="detail-option-row detail-option-row--stack">
+            <div class="detail-option-icon detail-option-icon--agent"><Icon name="monitor" :size="17" /></div>
+            <div class="detail-option-content">
+              <span class="detail-option-label">Agent 绑定</span>
+              <div class="agent-binding-editor">
+                <label>
+                  <span>Host</span>
+                  <input v-model.trim="agentHostDraft" type="text" placeholder="例如 cloudide-id 或 mac-home" />
+                </label>
+                <label>
+                  <span>任务标签</span>
+                  <input v-model="agentLabelsTextDraft" type="text" placeholder="逗号分隔，例如 coding, review" />
+                </label>
+              </div>
+              <small class="agent-binding-hint">绑定键由 Host + 任务标签共同确定</small>
+            </div>
+          </section>
+
+          <section class="detail-option-row detail-option-row--stack">
             <div class="detail-option-icon detail-option-icon--purple"><Icon name="recurring" :size="17" /></div>
             <div class="detail-option-content">
               <span class="detail-option-label">重复</span>
@@ -385,6 +407,8 @@ const reminderDraft = ref<number | null>(props.task.reminder_before ?? null);
 const subTasksDraft = ref<SubTask[]>(cloneSubTasks(props.task.sub_tasks));
 const tagsDraft = ref<string[]>(normalizeTags(props.task.tags));
 const tagDraft = ref('');
+const agentHostDraft = ref(props.task.agent_host || '');
+const agentLabelsTextDraft = ref(normalizeTags(props.task.agent_labels).join(', '));
 const subTasksDirty = ref(false);
 const tagsDirty = ref(false);
 const isEditingDate = ref(false);
@@ -421,6 +445,13 @@ const searchQueryTrimmed = computed(() => store.searchQuery.trim());
 const tagOptions = computed(() => mergeTagOptions(store.recentTags, tagsDraft.value));
 const subTasks = computed(() => subTasksDraft.value);
 const taskTags = computed(() => normalizeTags(props.task.tags));
+const agentLabels = computed(() => normalizeTags(props.task.agent_labels));
+const agentBindingText = computed(() => {
+  const host = (props.task.agent_host || '').trim();
+  const labels = agentLabels.value;
+  if (!host && !labels.length) return '';
+  return [host || '未指定 Host', labels.join(' · ')].filter(Boolean).join(' · ');
+});
 const subTaskTotal = computed(() => subTasks.value.length);
 const subTaskDone = computed(() => subTasks.value.filter((item) => item.done).length);
 const subTaskProgress = computed(() => subTaskTotal.value ? Math.round((subTaskDone.value / subTaskTotal.value) * 100) : 0);
@@ -635,6 +666,21 @@ watch(
   (next) => {
     if (tagsDirty.value) return;
     tagsDraft.value = normalizeTags(next);
+  },
+  { deep: true }
+);
+
+watch(
+  () => props.task.agent_host,
+  (next) => {
+    agentHostDraft.value = next || '';
+  }
+);
+
+watch(
+  () => props.task.agent_labels,
+  (next) => {
+    agentLabelsTextDraft.value = normalizeTags(next).join(', ');
   },
   { deep: true }
 );
@@ -1083,6 +1129,8 @@ async function saveDetailDrafts() {
       reminder_before: reminderDraft.value,
       sub_tasks: subTasks.value,
       tags: tagsDraft.value,
+      agent_host: agentHostDraft.value,
+      agent_labels: normalizeTags(agentLabelsTextDraft.value),
       notes: notesDraft.value
     });
     subTasksDraft.value = cloneSubTasks(subTasks.value);
@@ -1116,6 +1164,8 @@ async function duplicateTask() {
         done: false
       })),
       tags: tagsDraft.value,
+      agent_host: agentHostDraft.value,
+      agent_labels: normalizeTags(agentLabelsTextDraft.value),
       due_date: props.task.due_date || '',
       recurrence_rule: props.task.recurrence_rule || null,
       reminder_before: props.task.reminder_before ?? null
@@ -1167,20 +1217,20 @@ defineExpose({
 
 <style scoped>
 .task-card {
-  margin: 8px 10px;
-  padding: 10px 12px 10px 16px;
+  margin: 3px 8px;
+  padding: 5px 10px 5px 12px;
   background: var(--bg-solid, #ffffff);
   border-radius: var(--radius-card, 8px);
   border: 0.5px solid var(--border, #e5e5ea);
   box-shadow: var(--shadow-sm, 0 0.5px 2px rgba(0, 0, 0, 0.04));
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 7px;
   transition: all 0.15s ease;
   position: relative;
   cursor: default;
   height: auto;
-  min-height: 44px;
+  min-height: 32px;
 }
 
 .task-card:hover {
@@ -1205,15 +1255,15 @@ defineExpose({
 .priority-bar {
   position: absolute;
   left: 0;
-  top: 10px;
-  bottom: 10px;
-  width: 3px;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
   border-radius: 0 2px 2px 0;
 }
 
 .task-checkbox {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   border: 1.5px solid var(--text-placeholder);
   background: var(--bg-solid);
@@ -1304,10 +1354,10 @@ defineExpose({
 }
 
 .task-name {
-  font-size: var(--font-size-base, 13px);
+  font-size: 12px;
   font-weight: 400;
   color: var(--text-primary, #1d1d1f);
-  line-height: 1.4;
+  line-height: 1.25;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1321,11 +1371,11 @@ defineExpose({
 }
 
 .task-meta-line {
-  margin-top: 2px;
+  margin-top: 1px;
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 10px;
+  gap: 4px;
+  font-size: 9px;
   color: var(--text-tertiary);
   line-height: 1.1;
   max-width: 100%;
@@ -1336,7 +1386,7 @@ defineExpose({
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  padding: 1px 6px;
+  padding: 0 5px;
   border-radius: 999px;
   white-space: nowrap;
   min-width: 0;
@@ -1372,7 +1422,7 @@ defineExpose({
 
 .task-tag {
   max-width: 72px;
-  padding: 1px 6px;
+  padding: 0 5px;
   border-radius: 999px;
   color: var(--accent-cyan);
   background: color-mix(in srgb, var(--accent-cyan) 10%, var(--bg-solid));
@@ -1381,14 +1431,38 @@ defineExpose({
   white-space: nowrap;
 }
 
+.agent-binding-chip {
+  max-width: 132px;
+  min-width: 0;
+  height: 14px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 4px;
+  color: color-mix(in srgb, var(--accent-purple) 82%, var(--text-primary));
+  background: color-mix(in srgb, var(--accent-purple) 10%, var(--bg-solid));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-binding-chip__dot {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent-purple);
+}
+
 .task-name-inline-input {
   width: 100%;
   min-width: 0;
   border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
   border-radius: 8px;
   background: var(--bg-secondary, #f5f5f7);
-  padding: 4px 8px;
-  font-size: var(--font-size-base, 13px);
+  padding: 2px 6px;
+  font-size: 12px;
   font-weight: 400;
   color: var(--text-primary, #1d1d1f);
   line-height: 1.4;
@@ -1396,7 +1470,7 @@ defineExpose({
 }
 
 .inline-edit-hint {
-  margin: -4px 18px 6px 48px;
+  margin: -1px 16px 3px 40px;
   font-size: 10px;
   color: var(--text-tertiary);
 }
@@ -1971,6 +2045,10 @@ defineExpose({
 .detail-option-icon--amber { color: var(--accent-amber); background: var(--accent-amber-soft); }
 .detail-option-icon--slate { color: var(--accent-slate); background: var(--accent-slate-soft); }
 .detail-option-icon--cyan { color: var(--accent-cyan); background: var(--accent-cyan-soft); }
+.detail-option-icon--agent {
+  color: var(--accent-purple);
+  background: var(--accent-purple-soft);
+}
 
 .detail-option-content {
   min-width: 0;
@@ -2067,6 +2145,43 @@ defineExpose({
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+}
+
+.agent-binding-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+}
+
+.agent-binding-editor label {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.agent-binding-editor input {
+  min-width: 0;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  outline: none;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: var(--font-family);
+  font-size: 11px;
+}
+
+.agent-binding-editor input:focus {
+  border-color: var(--accent-purple);
+}
+
+.agent-binding-hint {
+  color: var(--text-tertiary);
+  font-size: 10px;
 }
 
 .task-detail-panel :deep(.recurrence-panel),

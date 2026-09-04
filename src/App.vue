@@ -1,8 +1,26 @@
 <template>
   <main class="h-full w-full bg-transparent text-[color:var(--text-primary)]">
-    <section class="app-container relative mx-auto flex h-full w-full flex-col" :class="{ 'app-container-mini': isMiniMode }">
+    <section
+      class="app-container relative mx-auto flex h-full w-full flex-col"
+      :class="{
+        'app-container-mini': isMiniMode,
+        'app-container-docked': isTopDocked && !isTopDockCollapsed,
+        'app-container-dock-handle': isTopDockCollapsed
+      }"
+      @mouseenter="onPanelMouseEnter"
+      @mouseleave="onPanelMouseLeave"
+    >
       <div
-        v-if="isMiniMode"
+        v-if="isTopDockCollapsed"
+        class="top-dock-handle"
+        title="悬停展开 Topdo"
+      >
+        <span class="top-dock-handle__grip"></span>
+        <span class="top-dock-handle__summary">{{ taskStore.todoCount }} 项待办</span>
+      </div>
+
+      <div
+        v-else-if="isMiniMode"
         class="mini-shell"
         :class="{ pressed: miniPressed, dragging: miniDragging, 'mini-shell--focus': focusedTask }"
         @mousedown="onMiniMouseDown"
@@ -57,7 +75,7 @@
         <HabitView v-else-if="appStore.currentMode === 'habits'" />
 
         <section v-else class="flex min-h-0 flex-1 flex-col bg-transparent">
-          <div class="px-3 pt-2">
+          <div class="px-2 pt-1">
             <StatsBar @add="openCreateTask()" />
           </div>
           <div v-if="searchQueryLabel" class="px-3 pt-2">
@@ -233,7 +251,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { LogicalSize, PhysicalPosition } from '@tauri-apps/api/dpi';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { currentMonitor, getCurrentWindow } from '@tauri-apps/api/window';
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import ConfirmDialog from './components/ConfirmDialog.vue';
 import CatPet from './components/CatPet/CatPet.vue';
@@ -266,6 +284,8 @@ const NORMAL_MIN_HEIGHT = 300;
 interface WindowStatePayload {
   mini_mode: boolean;
   always_on_top: boolean;
+  top_docked: boolean;
+  top_dock_collapsed: boolean;
 }
 
 interface WindowSizePayload {
@@ -328,6 +348,8 @@ const appWindow = getCurrentWindow();
 const currentView = ref<ViewType>('main');
 const isMiniMode = ref(false);
 const isAlwaysOnTop = ref(true);
+const isTopDocked = ref(false);
+const isTopDockCollapsed = ref(false);
 const createInlineVisible = ref(false);
 const createTemplate = ref<QuickTaskTemplate | null>(null);
 const shortcutSheetVisible = ref(false);
@@ -340,6 +362,10 @@ let miniPressStartedAt = 0;
 let miniMouseMoveHandler: ((event: MouseEvent) => void) | null = null;
 let miniMouseUpHandler: (() => void) | null = null;
 let miniSuppressClick = false;
+let topDockCollapseTimer: ReturnType<typeof setTimeout> | null = null;
+let topDockMoveTimer: ReturnType<typeof setTimeout> | null = null;
+let topDockTransitioning = false;
+let unlistenMoved: UnlistenFn | null = null;
 
 const toast = ref('');
 const reminderToasts = ref<InAppReminder[]>([]);
@@ -556,6 +582,8 @@ async function syncWindowState() {
     const state = await invoke<WindowStatePayload>('get_window_state');
     isMiniMode.value = state.mini_mode;
     isAlwaysOnTop.value = state.always_on_top;
+    isTopDocked.value = state.top_docked;
+    isTopDockCollapsed.value = state.top_dock_collapsed;
   } catch {
     // ignore
   }
@@ -757,6 +785,9 @@ async function onTogglePin() {
 async function onEnterMiniMode() {
   try {
     shortcutSheetVisible.value = false;
+    clearTopDockCollapseTimer();
+    isTopDocked.value = false;
+    isTopDockCollapsed.value = false;
     isMiniMode.value = true;
     petStore.windowMode = WindowMode.Cat;
     if (focusStore.hasActive) {
@@ -806,6 +837,9 @@ async function restoreNormalMode() {
   const focusTask = focusedTask.value;
   try {
     await invoke('set_window_mode', { mode: 'panel' });
+    clearTopDockCollapseTimer();
+    isTopDocked.value = false;
+    isTopDockCollapsed.value = false;
     isMiniMode.value = false;
     petStore.windowMode = WindowMode.Panel;
     await petStore.save();
@@ -930,6 +964,85 @@ function onMiniMouseDown(event: MouseEvent) {
   window.addEventListener('mouseup', miniMouseUpHandler);
   window.addEventListener('blur', cancelMiniInteraction);
   document.addEventListener('mouseleave', cancelMiniInteraction);
+}
+
+function clearTopDockCollapseTimer() {
+  if (!topDockCollapseTimer) return;
+  clearTimeout(topDockCollapseTimer);
+  topDockCollapseTimer = null;
+}
+
+async function currentPanelMetrics() {
+  const [position, size, scaleFactor, monitor] = await Promise.all([
+    appWindow.outerPosition(),
+    appWindow.outerSize(),
+    appWindow.scaleFactor(),
+    currentMonitor()
+  ]);
+  return {
+    position,
+    width: size.width / scaleFactor,
+    height: size.height / scaleFactor,
+    top: monitor?.workArea.position.y ?? monitor?.position.y ?? 0
+  };
+}
+
+async function setTopDockMode(mode: 'collapsed' | 'expanded' | 'off') {
+  if (topDockTransitioning || isMiniMode.value) return;
+  topDockTransitioning = true;
+  try {
+    const metrics = await currentPanelMetrics();
+    const state = await invoke<WindowStatePayload>('set_top_dock_mode', {
+      mode,
+      width: metrics.width,
+      height: metrics.height,
+      x: metrics.position.x,
+      y: metrics.top
+    });
+    isTopDocked.value = state.top_docked;
+    isTopDockCollapsed.value = state.top_dock_collapsed;
+  } catch (error) {
+    console.warn('切换顶部吸附失败:', error);
+  } finally {
+    window.setTimeout(() => {
+      topDockTransitioning = false;
+    }, 120);
+  }
+}
+
+function scheduleTopDockCollapse(delay = 520) {
+  clearTopDockCollapseTimer();
+  if (!isTopDocked.value || isTopDockCollapsed.value || isMiniMode.value) return;
+  topDockCollapseTimer = window.setTimeout(() => {
+    topDockCollapseTimer = null;
+    void setTopDockMode('collapsed');
+  }, delay);
+}
+
+function onPanelMouseEnter() {
+  clearTopDockCollapseTimer();
+  if (isTopDockCollapsed.value) {
+    void setTopDockMode('expanded');
+  }
+}
+
+function onPanelMouseLeave() {
+  scheduleTopDockCollapse();
+}
+
+async function reconcileTopDock(position: PhysicalPosition) {
+  if (isMiniMode.value || topDockTransitioning) return;
+  const monitor = await currentMonitor();
+  const top = monitor?.workArea.position.y ?? monitor?.position.y ?? 0;
+  const distanceFromTop = position.y - top;
+  if (!isTopDocked.value && distanceFromTop <= 10) {
+    await setTopDockMode('collapsed');
+    return;
+  }
+  if (isTopDocked.value && !isTopDockCollapsed.value && distanceFromTop > 28) {
+    clearTopDockCollapseTimer();
+    await setTopDockMode('off');
+  }
 }
 
 async function onHideToTray() {
@@ -1214,6 +1327,8 @@ onMounted(async () => {
   unlistenWindowModeChanged = await listen<WindowModeChangedPayload>('window-mode-changed', (event) => {
     const payload = event.payload;
     isMiniMode.value = payload.mini_mode;
+    isTopDocked.value = false;
+    isTopDockCollapsed.value = false;
     petStore.windowMode = payload.mode === 'cat' ? WindowMode.Cat : WindowMode.Panel;
     void petStore.save();
     if (payload.mode === 'cat') {
@@ -1248,7 +1363,7 @@ onMounted(async () => {
 
     resizeTimer = setTimeout(async () => {
       try {
-        if (isMiniMode.value) return;
+        if (isMiniMode.value || isTopDocked.value) return;
         await invoke('save_window_size', {
           width: Math.max(size.width, NORMAL_MIN_WIDTH),
           height: Math.max(size.height, NORMAL_MIN_HEIGHT)
@@ -1257,6 +1372,13 @@ onMounted(async () => {
         console.warn('保存窗口尺寸失败:', error);
       }
     }, 500);
+  });
+  unlistenMoved = await appWindow.onMoved(({ payload: position }) => {
+    if (topDockMoveTimer) clearTimeout(topDockMoveTimer);
+    topDockMoveTimer = window.setTimeout(() => {
+      topDockMoveTimer = null;
+      void reconcileTopDock(position);
+    }, 180);
   });
   unlistenFocusChanged = await appWindow.onFocusChanged(({ payload }) => {
     if (payload) {
@@ -1303,9 +1425,18 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', onVisibilityChange);
   document.removeEventListener('keydown', onGlobalKeydown);
   clearMiniDragListeners();
+  clearTopDockCollapseTimer();
+  if (topDockMoveTimer) {
+    clearTimeout(topDockMoveTimer);
+    topDockMoveTimer = null;
+  }
   if (unlistenResized) {
     unlistenResized();
     unlistenResized = null;
+  }
+  if (unlistenMoved) {
+    unlistenMoved();
+    unlistenMoved = null;
   }
   if (unlistenWindowModeChanged) {
     unlistenWindowModeChanged();
@@ -1416,6 +1547,47 @@ watch(
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   overflow: visible;
+}
+
+.app-container-docked {
+  border-radius: 0 0 12px 12px;
+}
+
+.app-container-dock-handle {
+  border: 0;
+  border-radius: 0 0 8px 8px;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.top-dock-handle {
+  width: 100%;
+  height: 12px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 0 0 8px 8px;
+  background: color-mix(in srgb, var(--bg-solid) 94%, transparent);
+  border: 0.5px solid var(--border-light);
+  border-top: 0;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.12);
+  cursor: default;
+}
+
+.top-dock-handle__grip {
+  width: 48px;
+  height: 3px;
+  margin-top: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 62%, var(--text-placeholder));
+}
+
+.top-dock-handle__summary {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .first-reminder-nudge {

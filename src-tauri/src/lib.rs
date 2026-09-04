@@ -20,7 +20,8 @@ use tauri::{
   Emitter,
   menu::{Menu, MenuItem},
   tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-  AppHandle, LogicalSize, Manager, Size, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+  AppHandle, LogicalSize, Manager, PhysicalPosition, Position, Size, State, WebviewUrl,
+  WebviewWindow, WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
@@ -37,6 +38,7 @@ const MINI_PILL_HEIGHT: f64 = 44.0;
 const FOCUS_MINI_MIN_WIDTH: f64 = 120.0;
 const FOCUS_MINI_MAX_WIDTH: f64 = 320.0;
 const FOCUS_MINI_HEIGHT: f64 = 44.0;
+const TOP_DOCK_COLLAPSED_HEIGHT: f64 = 12.0;
 const CONFIG_FILE_NAME: &str = "config.json";
 const DB_FILE_NAME: &str = "tasks.db";
 const TASK_ORDER_FILE_NAME: &str = "task_order.json";
@@ -45,6 +47,8 @@ const TOKEN_SALT: &str = "topdo-salt-2026";
 const DEFAULT_TOGGLE_SHORTCUT: &str = "Cmd+Shift+T";
 const DEFAULT_TOGGLE_MODE_SHORTCUT: &str = "Alt+T";
 const DEFAULT_QUICK_CAPTURE_SHORTCUT: &str = "Alt+Space";
+const FEISHU_AGENT_HOST_FIELD: &str = "Agent Host";
+const FEISHU_AGENT_LABELS_FIELD: &str = "Agent 任务标签";
 const FEISHU_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const FEISHU_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -84,7 +88,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_synced_at TEXT DEFAULT '',
     retry_count INTEGER DEFAULT 0,
     last_error TEXT DEFAULT '',
-    last_retry_at TEXT DEFAULT ''
+    last_retry_at TEXT DEFAULT '',
+    agent_host TEXT DEFAULT '',
+    agent_labels TEXT DEFAULT '[]'
 );
 "#;
 
@@ -123,12 +129,18 @@ struct SyncStatus {
 struct UiState {
   mini_mode: bool,
   always_on_top: bool,
+  top_docked: bool,
+  top_dock_collapsed: bool,
+  top_dock_restore_width: f64,
+  top_dock_restore_height: f64,
 }
 
 #[derive(Debug, Serialize)]
 struct WindowStatePayload {
   mini_mode: bool,
   always_on_top: bool,
+  top_docked: bool,
+  top_dock_collapsed: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -385,6 +397,8 @@ struct Task {
   retry_count: i64,
   last_error: String,
   last_retry_at: String,
+  agent_host: String,
+  agent_labels: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -875,6 +889,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     retry_count: row.get::<_, Option<i64>>(24)?.unwrap_or(0),
     last_error: text(row, 25)?,
     last_retry_at: text(row, 26)?,
+    agent_host: text(row, 27)?,
+    agent_labels: text_or(row, 28, "[]")?,
   })
 }
 
@@ -927,6 +943,8 @@ fn open_db(path: &PathBuf) -> Result<Connection, String> {
   ensure_column(&conn, "tasks", "retry_count", "INTEGER DEFAULT 0")?;
   ensure_column(&conn, "tasks", "last_error", "TEXT DEFAULT ''")?;
   ensure_column(&conn, "tasks", "last_retry_at", "TEXT DEFAULT ''")?;
+  ensure_column(&conn, "tasks", "agent_host", "TEXT DEFAULT ''")?;
+  ensure_column(&conn, "tasks", "agent_labels", "TEXT DEFAULT '[]'")?;
 
   conn
     .execute(
@@ -970,6 +988,12 @@ fn open_db(path: &PathBuf) -> Result<Connection, String> {
       [],
     )
     .map_err(|err| format!("backfill sync_status failed: {err}"))?;
+  conn
+    .execute(
+      "UPDATE tasks SET agent_labels = '[]' WHERE agent_labels IS NULL OR agent_labels = ''",
+      [],
+    )
+    .map_err(|err| format!("backfill agent_labels failed: {err}"))?;
   Ok(conn)
 }
 
@@ -978,8 +1002,8 @@ fn upsert_task(conn: &Connection, task: &Task) -> Result<(), String> {
   conn
     .execute(
       "INSERT INTO tasks (
-        record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
       ON CONFLICT(record_id) DO UPDATE SET
         id=excluded.id,
         name=CASE WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.name ELSE excluded.name END,
@@ -1015,7 +1039,17 @@ fn upsert_task(conn: &Connection, task: &Task) -> Result<(), String> {
         last_synced_at=excluded.last_synced_at,
         retry_count=CASE WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.retry_count ELSE excluded.retry_count END,
         last_error=CASE WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.last_error ELSE excluded.last_error END,
-        last_retry_at=CASE WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.last_retry_at ELSE excluded.last_retry_at END",
+        last_retry_at=CASE WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.last_retry_at ELSE excluded.last_retry_at END,
+        agent_host=CASE
+          WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.agent_host
+          WHEN excluded.source = 'feishu' AND excluded.agent_host = '' THEN tasks.agent_host
+          ELSE excluded.agent_host
+        END,
+        agent_labels=CASE
+          WHEN tasks.source = 'feishu' AND tasks.sync_status IN ('pending', 'failed') AND excluded.source = 'feishu' THEN tasks.agent_labels
+          WHEN excluded.source = 'feishu' AND excluded.agent_labels = '' THEN tasks.agent_labels
+          ELSE excluded.agent_labels
+        END",
       params![
         task.record_id,
         task.id,
@@ -1043,7 +1077,9 @@ fn upsert_task(conn: &Connection, task: &Task) -> Result<(), String> {
         task.last_synced_at,
         task.retry_count,
         task.last_error,
-        task.last_retry_at
+        task.last_retry_at,
+        task.agent_host,
+        task.agent_labels
       ],
     )
     .map_err(|err| format!("upsert task failed: {err}"))?;
@@ -1064,6 +1100,27 @@ fn apply_normal_mode(window: &WebviewWindow) -> tauri::Result<()> {
   ))))?;
   window.set_max_size(Option::<Size>::None)?;
   window.set_size(Size::Logical(LogicalSize::new(NORMAL_WIDTH, NORMAL_HEIGHT)))?;
+  Ok(())
+}
+
+fn apply_panel_constraints(window: &WebviewWindow) -> tauri::Result<()> {
+  window.set_max_size(Option::<Size>::None)?;
+  window.set_resizable(true)?;
+  window.set_min_size(Some(Size::Logical(LogicalSize::new(
+    NORMAL_MIN_WIDTH,
+    NORMAL_MIN_HEIGHT,
+  ))))?;
+  Ok(())
+}
+
+fn apply_top_dock_size(window: &WebviewWindow, width: f64) -> tauri::Result<()> {
+  let size = Size::Logical(LogicalSize::new(width.max(NORMAL_MIN_WIDTH), TOP_DOCK_COLLAPSED_HEIGHT));
+  window.set_min_size(Option::<Size>::None)?;
+  window.set_max_size(Option::<Size>::None)?;
+  window.set_resizable(false)?;
+  window.set_size(size)?;
+  window.set_min_size(Some(size))?;
+  window.set_max_size(Some(size))?;
   Ok(())
 }
 
@@ -1859,6 +1916,11 @@ async fn fetch_remote_tasks(app: &AppHandle, filter_completed: bool) -> Result<V
       recurrence_index: None,
       reminder_before: None,
       reminder_notified: false,
+      agent_host: field_string(&record.fields, FEISHU_AGENT_HOST_FIELD),
+      agent_labels: match record.fields.get(FEISHU_AGENT_LABELS_FIELD) {
+        Some(value) => feishu_tags_value_to_local_json(Some(value)),
+        None => String::new(),
+      },
       source: "feishu".to_string(),
       feishu_record_id: rid,
       sync_status: "synced".to_string(),
@@ -1955,6 +2017,13 @@ fn insert_feishu_field_if_exists(
   if let Some(map) = fields.as_object_mut() {
     map.insert(field_name.to_string(), value);
   }
+}
+
+fn feishu_agent_labels_value(fields: &[FeishuFieldPayload], raw: &str) -> Option<Value> {
+  let field = fields
+    .iter()
+    .find(|field| field.field_name == FEISHU_AGENT_LABELS_FIELD)?;
+  local_tags_to_feishu_value(raw, field.field_type).ok()
 }
 
 fn parse_feishu_field_option_details(item: &Value) -> Vec<FeishuFieldOption> {
@@ -2410,6 +2479,20 @@ async fn feishu_create_record(app: &AppHandle, task: &Task) -> Result<String, St
       tag_value,
     );
   }
+  insert_feishu_field_if_exists(
+    &mut fields,
+    &field_names,
+    FEISHU_AGENT_HOST_FIELD,
+    Value::String(task.agent_host.clone()),
+  );
+  if let Some(agent_labels_value) = feishu_agent_labels_value(&write_fields, &task.agent_labels) {
+    insert_feishu_field_if_exists(
+      &mut fields,
+      &field_names,
+      FEISHU_AGENT_LABELS_FIELD,
+      agent_labels_value,
+    );
+  }
 
   let mut force_refresh = false;
   for _ in 0..3 {
@@ -2551,7 +2634,7 @@ async fn db_get_all_tasks(app: AppHandle) -> Result<Vec<Task>, String> {
     let conn = open_db(&db_path)?;
     let mut stmt = conn
       .prepare(
-        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels
          FROM tasks",
       )
       .map_err(|err| format!("prepare query failed: {err}"))?;
@@ -2577,7 +2660,7 @@ async fn db_get_feishu_tasks(app: AppHandle) -> Result<Vec<Task>, String> {
     let conn = open_db(&db_path)?;
     let mut stmt = conn
       .prepare(
-        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels
          FROM tasks
          WHERE source = 'feishu'",
       )
@@ -2700,6 +2783,8 @@ async fn db_update_field_pending(
       "任务更新时间" => "updated_at",
       "备注/收获" => "notes",
       "标签" => "tags",
+      FEISHU_AGENT_HOST_FIELD => "agent_host",
+      FEISHU_AGENT_LABELS_FIELD => "agent_labels",
       _ => return Err("不支持的字段名".to_string()),
     };
 
@@ -2818,7 +2903,7 @@ async fn db_get_pending_tasks(app: AppHandle) -> Result<Vec<Task>, String> {
     let conn = open_db(&db_path)?;
     let mut stmt = conn
       .prepare(
-        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels
          FROM tasks
          WHERE sync_status = 'pending' AND source = 'feishu'
          ORDER BY updated_at ASC",
@@ -2999,7 +3084,7 @@ async fn get_local_tasks(app: AppHandle) -> Result<Vec<Task>, String> {
     let conn = open_db(&db_path)?;
     let mut stmt = conn
       .prepare(
-        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels
          FROM tasks WHERE source = 'local' ORDER BY sort_order DESC, updated_at DESC",
       )
       .map_err(|err| format!("prepare local tasks failed: {err}"))?;
@@ -3059,6 +3144,8 @@ async fn create_local_task(
     recurrence_index: None,
     reminder_before: None,
     reminder_notified: false,
+    agent_host: String::new(),
+    agent_labels: "[]".to_string(),
     source: "local".to_string(),
     feishu_record_id: String::new(),
     sync_status: "synced".to_string(),
@@ -3085,7 +3172,7 @@ async fn update_local_task(
     let conn = open_db(&db_path)?;
     let mut task: Task = conn
       .query_row(
-        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels
          FROM tasks WHERE id = ?1 OR record_id = ?1",
         params![id.clone()],
         task_from_row,
@@ -3160,6 +3247,18 @@ async fn update_local_task(
     }
     if let Some(v) = fields.get("reminder_notified") {
       task.reminder_notified = matches!(v.trim(), "1" | "true" | "yes");
+    }
+    if let Some(v) = fields.get("agent_host") {
+      task.agent_host = v.trim().to_string();
+      sync_affecting = true;
+    }
+    if let Some(v) = fields.get("agent_labels") {
+      task.agent_labels = if v.trim().is_empty() {
+        "[]".to_string()
+      } else {
+        v.to_string()
+      };
+      sync_affecting = true;
     }
     task.updated_at = now_iso();
     task.sync_status = if task.source == "feishu" && !sync_affecting {
@@ -3690,6 +3789,8 @@ fn set_window_mode_internal_with_variant(
     apply_normal_mode(&window).map_err(|err| err.to_string())?;
     state.mini_mode = false;
   }
+  state.top_docked = false;
+  state.top_dock_collapsed = false;
   apply_window_traits(
     &window,
     state.always_on_top,
@@ -3877,6 +3978,86 @@ fn get_window_state(state: State<'_, Mutex<UiState>>) -> Result<WindowStatePaylo
   Ok(WindowStatePayload {
     mini_mode: state.mini_mode,
     always_on_top: state.always_on_top,
+    top_docked: state.top_docked,
+    top_dock_collapsed: state.top_dock_collapsed,
+  })
+}
+
+#[tauri::command]
+fn set_top_dock_mode(
+  app: AppHandle,
+  state: State<'_, Mutex<UiState>>,
+  mode: String,
+  width: f64,
+  height: f64,
+  x: i32,
+  y: i32,
+) -> Result<WindowStatePayload, String> {
+  let window = get_main_window(&app)?;
+  let mut state = state
+    .lock()
+    .map_err(|_| "failed to lock ui state".to_string())?;
+  if state.mini_mode {
+    return Err("迷你模式下不能启用顶部吸附".to_string());
+  }
+
+  let normalized_width = width.max(NORMAL_MIN_WIDTH);
+  let normalized_height = height.max(NORMAL_MIN_HEIGHT);
+  if !state.top_docked {
+    state.top_dock_restore_width = normalized_width;
+    state.top_dock_restore_height = normalized_height;
+  }
+
+  match mode.trim() {
+    "collapsed" => {
+      state.top_docked = true;
+      state.top_dock_collapsed = true;
+      apply_top_dock_size(&window, state.top_dock_restore_width)
+        .map_err(|err| err.to_string())?;
+      window
+        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .map_err(|err| err.to_string())?;
+    }
+    "expanded" => {
+      state.top_docked = true;
+      state.top_dock_collapsed = false;
+      apply_panel_constraints(&window).map_err(|err| err.to_string())?;
+      window
+        .set_size(Size::Logical(LogicalSize::new(
+          state.top_dock_restore_width,
+          state.top_dock_restore_height,
+        )))
+        .map_err(|err| err.to_string())?;
+      window
+        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .map_err(|err| err.to_string())?;
+    }
+    "off" => {
+      state.top_docked = false;
+      state.top_dock_collapsed = false;
+      apply_panel_constraints(&window).map_err(|err| err.to_string())?;
+      window
+        .set_size(Size::Logical(LogicalSize::new(
+          state.top_dock_restore_width,
+          state.top_dock_restore_height,
+        )))
+        .map_err(|err| err.to_string())?;
+    }
+    _ => return Err("不支持的顶部吸附模式".to_string()),
+  }
+
+  apply_window_traits(
+    &window,
+    state.always_on_top,
+    should_include_native_traits("set_top_dock_mode"),
+    "set_top_dock_mode",
+  )?;
+
+  Ok(WindowStatePayload {
+    mini_mode: state.mini_mode,
+    always_on_top: state.always_on_top,
+    top_docked: state.top_docked,
+    top_dock_collapsed: state.top_dock_collapsed,
   })
 }
 
@@ -4923,6 +5104,8 @@ async fn create_task(
     recurrence_index: None,
     reminder_before: None,
     reminder_notified: false,
+    agent_host: String::new(),
+    agent_labels: "[]".to_string(),
     source: "feishu".to_string(),
     feishu_record_id: String::new(),
     sync_status: "pending".to_string(),
@@ -5071,6 +5254,20 @@ async fn sync_tasks(
         tag_value,
       );
     }
+    insert_feishu_field_if_exists(
+      &mut fields,
+      &field_names,
+      FEISHU_AGENT_HOST_FIELD,
+      Value::String(task.agent_host.clone()),
+    );
+    if let Some(agent_labels_value) = feishu_agent_labels_value(&write_fields, &task.agent_labels) {
+      insert_feishu_field_if_exists(
+        &mut fields,
+        &field_names,
+        FEISHU_AGENT_LABELS_FIELD,
+        agent_labels_value,
+      );
+    }
 
     match feishu_update_record_fields(&app, &task.record_id, fields).await {
       Ok(_) => {
@@ -5100,6 +5297,10 @@ pub fn run() {
     .manage(Mutex::new(UiState {
       mini_mode: false,
       always_on_top: true,
+      top_docked: false,
+      top_dock_collapsed: false,
+      top_dock_restore_width: NORMAL_WIDTH,
+      top_dock_restore_height: NORMAL_HEIGHT,
     }))
     .manage(Mutex::new(ConfigIoLock))
     .manage(Mutex::new(GlobalShortcutState::default()))
@@ -5139,6 +5340,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       check_feishu_api_client,
       get_window_state,
+      set_top_dock_mode,
       reapply_window_traits,
       toggle_always_on_top,
       enter_mini_mode,
@@ -5225,6 +5427,8 @@ mod tests {
       recurrence_index: None,
       reminder_before: None,
       reminder_notified: false,
+      agent_host: String::new(),
+      agent_labels: "[]".to_string(),
       source: "feishu".to_string(),
       feishu_record_id: record_id.to_string(),
       sync_status: "synced".to_string(),
@@ -5249,6 +5453,8 @@ mod tests {
       .expect("add reminder_before");
     ensure_column(conn, "tasks", "reminder_notified", "INTEGER DEFAULT 0")
       .expect("add reminder_notified");
+    ensure_column(conn, "tasks", "agent_host", "TEXT DEFAULT ''").expect("add agent_host");
+    ensure_column(conn, "tasks", "agent_labels", "TEXT DEFAULT '[]'").expect("add agent_labels");
   }
 
   fn mapped_feishu_config() -> FeishuConfig {
@@ -5342,6 +5548,53 @@ mod tests {
   fn clearing_tags_uses_null_for_any_supported_field_type() {
     assert_eq!(local_tags_to_feishu_value("[]", 1), Ok(Value::Null));
     assert_eq!(local_tags_to_feishu_value("[]", 4), Ok(Value::Null));
+  }
+
+  #[test]
+  fn agent_binding_round_trips_through_sqlite() {
+    let conn = Connection::open_in_memory().expect("open test db");
+    create_test_tasks_table(&conn);
+    let mut task = test_task("record-agent", "[]");
+    task.agent_host = "mac-home".to_string();
+    task.agent_labels = r#"["coding","review"]"#.to_string();
+    upsert_task(&conn, &task).expect("save agent binding");
+
+    let saved = conn
+      .query_row(
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels FROM tasks WHERE record_id = ?1",
+        params![task.record_id],
+        task_from_row,
+      )
+      .expect("read agent binding");
+
+    assert_eq!(saved.agent_host, "mac-home");
+    assert_eq!(saved.agent_labels, r#"["coding","review"]"#);
+  }
+
+  #[test]
+  fn missing_remote_agent_fields_preserve_local_binding() {
+    let conn = Connection::open_in_memory().expect("open test db");
+    create_test_tasks_table(&conn);
+    let mut local = test_task("record-agent-preserve", "[]");
+    local.agent_host = "cloudide-id".to_string();
+    local.agent_labels = r#"["research"]"#.to_string();
+    upsert_task(&conn, &local).expect("seed local agent binding");
+
+    let mut remote_without_fields = test_task("record-agent-preserve", "[]");
+    remote_without_fields.agent_host = String::new();
+    remote_without_fields.agent_labels = String::new();
+    upsert_task(&conn, &remote_without_fields).expect("merge remote task without agent fields");
+
+    let saved = conn
+      .query_row(
+        "SELECT record_id, id, name, status, priority, task_type, time_spent, created_at, updated_at, completed_at, notes, sort_order, sub_tasks, tags, due_date, recurrence_rule, recurrence_parent_id, recurrence_index, reminder_before, reminder_notified, source, feishu_record_id, sync_status, last_synced_at, retry_count, last_error, last_retry_at, agent_host, agent_labels FROM tasks WHERE record_id = ?1",
+        params![local.record_id],
+        task_from_row,
+      )
+      .expect("read preserved agent binding");
+
+    assert_eq!(saved.agent_host, "cloudide-id");
+    assert_eq!(saved.agent_labels, r#"["research"]"#);
   }
 
   #[test]

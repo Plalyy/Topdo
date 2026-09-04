@@ -54,6 +54,8 @@ interface CreateTaskInput {
   recurrence_parent_id?: string;
   recurrence_index?: number;
   reminder_before?: number | null;
+  agent_host?: string;
+  agent_labels?: string[];
 }
 
 const FEISHU_RECORDS_URL = '/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records';
@@ -291,7 +293,9 @@ function normalizeTask(task: Task): Task {
     recurrence_parent_id: String((task as any).recurrence_parent_id || ''),
     recurrence_index: (task as any).recurrence_index === null || (task as any).recurrence_index === undefined ? null : Number((task as any).recurrence_index),
     reminder_before: (task as any).reminder_before === null || (task as any).reminder_before === undefined ? null : Number((task as any).reminder_before),
-    reminder_notified: Boolean((task as any).reminder_notified)
+    reminder_notified: Boolean((task as any).reminder_notified),
+    agent_host: String((task as any).agent_host || '').trim(),
+    agent_labels: normalizeTags((task as any).agent_labels)
   };
 }
 
@@ -465,7 +469,13 @@ function applySearchFilter(tasks: Task[], searchQuery: string): Task[] {
     const name = (task.name || '').toLowerCase();
     const notes = (task.notes || '').toLowerCase();
     const tags = normalizeTags((task as any).tags).join(' ').toLowerCase();
-    return name.includes(query) || notes.includes(query) || tags.includes(query);
+    const agentHost = String(task.agent_host || '').toLowerCase();
+    const agentLabels = normalizeTags(task.agent_labels).join(' ').toLowerCase();
+    return name.includes(query)
+      || notes.includes(query)
+      || tags.includes(query)
+      || agentHost.includes(query)
+      || agentLabels.includes(query);
   });
 }
 
@@ -831,6 +841,22 @@ export const useTaskStore = defineStore('task', {
           fields.reminder_notified = '0';
           patch.reminder_before = reminderBefore;
           patch.reminder_notified = false;
+        }
+      }
+      if (input.agent_host !== undefined) {
+        const agentHost = input.agent_host.trim();
+        if (agentHost !== (target.agent_host || '').trim()) {
+          fields.agent_host = agentHost;
+          patch.agent_host = agentHost;
+          remoteAffectingChanged = true;
+        }
+      }
+      if (input.agent_labels !== undefined) {
+        const agentLabels = normalizeTags(input.agent_labels);
+        if (JSON.stringify(agentLabels) !== JSON.stringify(normalizeTags(target.agent_labels || []))) {
+          fields.agent_labels = JSON.stringify(agentLabels);
+          patch.agent_labels = agentLabels;
+          remoteAffectingChanged = true;
         }
       }
 
@@ -1573,6 +1599,8 @@ export const useTaskStore = defineStore('task', {
       const recurrenceParentId = (taskInput.recurrence_parent_id || '').trim();
       const recurrenceIndex = taskInput.recurrence_index ?? null;
       const reminderBefore = taskInput.reminder_before ?? null;
+      const agentHost = (taskInput.agent_host || '').trim();
+      const agentLabels = normalizeTags(taskInput.agent_labels || []);
 
       if (this.mode === 'local') {
         let created: Task;
@@ -1625,6 +1653,12 @@ export const useTaskStore = defineStore('task', {
           fields.reminder_before = reminderBefore === null ? '' : String(reminderBefore);
           fields.reminder_notified = '0';
         }
+        if (agentHost || agentLabels.length) {
+          patch.agent_host = agentHost;
+          patch.agent_labels = agentLabels;
+          fields.agent_host = agentHost;
+          fields.agent_labels = JSON.stringify(agentLabels);
+        }
 
         if (Object.keys(fields).length > 0) {
           try {
@@ -1673,6 +1707,8 @@ export const useTaskStore = defineStore('task', {
         recurrence_index: recurrenceIndex,
         reminder_before: reminderBefore,
         reminder_notified: false,
+        agent_host: agentHost,
+        agent_labels: agentLabels,
         source: 'feishu',
         feishu_record_id: '',
         sync_status: 'pending',
@@ -1735,7 +1771,7 @@ export const useTaskStore = defineStore('task', {
           localPatch.due_date = dueDate;
           localFields.due_date = dueDate;
         }
-        if (notes || subTasks.length || tags.length || recurrenceRule || recurrenceParentId || recurrenceIndex || reminderBefore !== null) {
+        if (notes || subTasks.length || tags.length || recurrenceRule || recurrenceParentId || recurrenceIndex || reminderBefore !== null || agentHost || agentLabels.length) {
           localPatch.notes = notes;
           localPatch.sub_tasks = subTasks;
           localPatch.tags = tags;
@@ -1744,6 +1780,8 @@ export const useTaskStore = defineStore('task', {
           localPatch.recurrence_index = recurrenceIndex;
           localPatch.reminder_before = reminderBefore;
           localPatch.reminder_notified = false;
+          localPatch.agent_host = agentHost;
+          localPatch.agent_labels = agentLabels;
           localFields.notes = notes;
           localFields.sub_tasks = JSON.stringify(subTasks);
           localFields.tags = JSON.stringify(tags);
@@ -1752,6 +1790,8 @@ export const useTaskStore = defineStore('task', {
           localFields.recurrence_index = recurrenceIndex === null ? '' : String(recurrenceIndex);
           localFields.reminder_before = reminderBefore === null ? '' : String(reminderBefore);
           localFields.reminder_notified = '0';
+          localFields.agent_host = agentHost;
+          localFields.agent_labels = JSON.stringify(agentLabels);
         }
         if (Object.keys(localFields).length > 0) {
           try {
