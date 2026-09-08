@@ -44,13 +44,14 @@
       <template v-else>
         <TitleBar
           :always-on-top="isAlwaysOnTop"
+          :market-active="currentView === 'market'"
           :resolved-theme="resolvedTheme"
+          @market="toggleMarketView"
           @settings="toggleSettingsView"
           @toggle-pin="onTogglePin"
           @toggle-theme="onToggleTheme"
           @mini="onEnterMiniMode"
           @close-to-tray="onHideToTray"
-          @drag-end="reconcileTopDock"
         />
 
         <section v-if="currentView === 'welcome'" class="min-h-0 flex-1">
@@ -59,6 +60,10 @@
 
         <section v-else-if="currentView === 'settings'" class="min-h-0 flex-1">
           <Settings ref="settingsRef" @back="currentView = 'main'" @saved="onSettingsSaved" />
+        </section>
+
+        <section v-else-if="currentView === 'market'" class="view-flip-shell min-h-0 flex-1">
+          <MarketView />
         </section>
 
         <section v-else-if="taskStore.loading && taskStore.tasks.length === 0" class="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 bg-transparent">
@@ -256,6 +261,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import ConfirmDialog from './components/ConfirmDialog.vue';
 import CatPet from './components/CatPet/CatPet.vue';
+import MarketView from './components/MarketView.vue';
 import OnboardingBar from './components/OnboardingBar.vue';
 import PanelCatCorner from './components/PanelCatCorner.vue';
 import ReminderToast from './components/ReminderToast.vue';
@@ -278,9 +284,11 @@ import { WindowMode } from './types/pet';
 import { startHabitReminderService, startReminderService, type InAppReminder } from './utils/reminder';
 import { initializeTheme, toggleThemeQuickly, useThemeState } from './utils/theme';
 
-type ViewType = 'welcome' | 'main' | 'settings';
+type ViewType = 'welcome' | 'main' | 'market' | 'settings';
 const NORMAL_MIN_WIDTH = 320;
 const NORMAL_MIN_HEIGHT = 300;
+const NORMAL_MAX_WIDTH = 500;
+const NORMAL_MAX_HEIGHT = 900;
 
 interface WindowStatePayload {
   mini_mode: boolean;
@@ -972,39 +980,36 @@ function clearTopDockCollapseTimer() {
   topDockCollapseTimer = null;
 }
 
-async function currentPanelMetrics() {
-  const [size, scaleFactor] = await Promise.all([
-    appWindow.outerSize(),
-    appWindow.scaleFactor()
-  ]);
-  return {
-    width: size.width / scaleFactor,
-    height: size.height / scaleFactor
-  };
-}
-
 async function setTopDockMode(mode: 'collapsed' | 'expanded' | 'off') {
   if (topDockTransitioning || isMiniMode.value) return;
   topDockTransitioning = true;
+  const previousDocked = isTopDocked.value;
+  const previousCollapsed = isTopDockCollapsed.value;
+  if (mode === 'collapsed') {
+    isTopDocked.value = true;
+  } else if (mode === 'expanded') {
+    isTopDocked.value = true;
+    isTopDockCollapsed.value = false;
+  } else {
+    isTopDocked.value = false;
+    isTopDockCollapsed.value = false;
+  }
   try {
-    const metrics = await currentPanelMetrics();
     const state = await invoke<WindowStatePayload>('set_top_dock_mode', {
-      mode,
-      width: metrics.width,
-      height: metrics.height
+      mode
     });
     isTopDocked.value = state.top_docked;
     isTopDockCollapsed.value = state.top_dock_collapsed;
   } catch (error) {
+    isTopDocked.value = previousDocked;
+    isTopDockCollapsed.value = previousCollapsed;
     console.warn('切换顶部吸附失败:', error);
   } finally {
-    window.setTimeout(() => {
-      topDockTransitioning = false;
-    }, 120);
+    topDockTransitioning = false;
   }
 }
 
-function scheduleTopDockCollapse(delay = 520) {
+function scheduleTopDockCollapse(delay = 500) {
   clearTopDockCollapseTimer();
   if (!isTopDocked.value || isTopDockCollapsed.value || isMiniMode.value) return;
   topDockCollapseTimer = window.setTimeout(() => {
@@ -1016,24 +1021,13 @@ function scheduleTopDockCollapse(delay = 520) {
 
 function onPanelMouseEnter() {
   clearTopDockCollapseTimer();
-  if (isTopDockCollapsed.value) {
+  if (isTopDocked.value && !isTopDockCollapsed.value) {
     void setTopDockMode('expanded');
   }
 }
 
 function onPanelMouseLeave() {
   scheduleTopDockCollapse();
-}
-
-async function reconcileTopDock() {
-  if (isMiniMode.value || topDockTransitioning) return;
-  try {
-    const state = await invoke<WindowStatePayload>('reconcile_top_dock');
-    isTopDocked.value = state.top_docked;
-    isTopDockCollapsed.value = state.top_dock_collapsed;
-  } catch (error) {
-    console.warn('检查顶部吸附失败:', error);
-  }
 }
 
 async function onHideToTray() {
@@ -1126,6 +1120,12 @@ function toggleSettingsView() {
   currentView.value = currentView.value === 'settings' ? 'main' : 'settings';
 }
 
+function toggleMarketView() {
+  currentView.value = currentView.value === 'market' ? 'main' : 'market';
+  taskStore.closeSearch();
+  shortcutSheetVisible.value = false;
+}
+
 function openSearch() {
   if (currentView.value !== 'main' || isMiniMode.value) return;
   taskStore.openSearch();
@@ -1212,6 +1212,10 @@ function onGlobalKeydown(event: KeyboardEvent) {
     if (currentView.value === 'settings') {
       const consumed = settingsRef.value?.handleEsc?.() === true;
       if (!consumed) currentView.value = 'main';
+      return;
+    }
+    if (currentView.value === 'market') {
+      currentView.value = 'main';
       return;
     }
     if (createInlineVisible.value) {
@@ -1345,10 +1349,24 @@ onMounted(async () => {
   try {
     const savedSize = await invoke<WindowSizePayload | null>('get_window_size');
     if (!isMiniMode.value && savedSize && savedSize.width > 0 && savedSize.height > 0) {
+      const scaleFactor = await appWindow.scaleFactor();
+      const storedAsPhysicalPixels =
+        savedSize.width > NORMAL_MAX_WIDTH || savedSize.height > NORMAL_MAX_HEIGHT;
+      const logicalWidth = storedAsPhysicalPixels ? savedSize.width / scaleFactor : savedSize.width;
+      const logicalHeight = storedAsPhysicalPixels ? savedSize.height / scaleFactor : savedSize.height;
+      const restoredWidth = Math.min(Math.max(logicalWidth, NORMAL_MIN_WIDTH), NORMAL_MAX_WIDTH);
+      const restoredHeight = Math.min(Math.max(logicalHeight, NORMAL_MIN_HEIGHT), NORMAL_MAX_HEIGHT);
       await appWindow.setSize(new LogicalSize(
-        Math.max(savedSize.width, NORMAL_MIN_WIDTH),
-        Math.max(savedSize.height, NORMAL_MIN_HEIGHT)
+        restoredWidth,
+        restoredHeight
       ));
+      await invoke('ensure_main_window_visible');
+      if (storedAsPhysicalPixels) {
+        await invoke('save_window_size', {
+          width: restoredWidth,
+          height: restoredHeight
+        });
+      }
     }
   } catch (error) {
     console.warn('恢复窗口尺寸失败:', error);
@@ -1362,9 +1380,11 @@ onMounted(async () => {
     resizeTimer = setTimeout(async () => {
       try {
         if (isMiniMode.value || isTopDocked.value) return;
+        const scaleFactor = await appWindow.scaleFactor();
+        const logicalSize = size.toLogical(scaleFactor);
         await invoke('save_window_size', {
-          width: Math.max(size.width, NORMAL_MIN_WIDTH),
-          height: Math.max(size.height, NORMAL_MIN_HEIGHT)
+          width: Math.min(Math.max(logicalSize.width, NORMAL_MIN_WIDTH), NORMAL_MAX_WIDTH),
+          height: Math.min(Math.max(logicalSize.height, NORMAL_MIN_HEIGHT), NORMAL_MAX_HEIGHT)
         });
       } catch (error) {
         console.warn('保存窗口尺寸失败:', error);
@@ -1546,6 +1566,23 @@ watch(
   background: transparent;
   box-shadow: none;
   overflow: visible;
+}
+
+.view-flip-shell {
+  transform-origin: center center;
+  animation: view-flip-in 180ms cubic-bezier(0.2, 0.75, 0.25, 1) both;
+  backface-visibility: hidden;
+}
+
+@keyframes view-flip-in {
+  from {
+    opacity: 0.35;
+    transform: perspective(800px) rotateY(-7deg) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: perspective(800px) rotateY(0) scale(1);
+  }
 }
 
 .top-dock-handle {
