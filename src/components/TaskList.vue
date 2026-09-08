@@ -60,12 +60,14 @@
           @click="isGroupCollapsible(group.key) && toggleGroupCollapse(group.key)"
         >
           <span class="task-group__title">
-            <span
+            <Icon
               v-if="isGroupCollapsible(group.key)"
               class="task-group__chevron"
               :class="{ collapsed: isGroupCollapsed(group.key) }"
-            >⌄</span>
-            {{ group.label }}
+              name="chevron-down"
+              :size="12"
+            />
+            <span class="task-group__label">{{ group.label }}</span>
           </span>
           <span>{{ group.tasks.length }}</span>
         </button>
@@ -133,6 +135,7 @@ import { useTaskStore } from '../stores/taskStore';
 import type { SyncState } from '../stores/taskStore';
 import type { RecurrenceRule, Task } from '../types';
 import QuickInput from './QuickInput.vue';
+import Icon from './Icon.vue';
 import TaskItem from './TaskItem.vue';
 
 interface QuickTaskTemplate {
@@ -251,9 +254,7 @@ type TaskGroup = {
 
 function loadCollapsedGroups(): Record<string, boolean> {
   try {
-    const stored = JSON.parse(localStorage.getItem(COLLAPSED_GROUPS_KEY) || '{}') || {};
-    delete stored.urgent;
-    return stored;
+    return JSON.parse(localStorage.getItem(COLLAPSED_GROUPS_KEY) || '{}') || {};
   } catch {
     return {};
   }
@@ -267,7 +268,7 @@ function isGroupCollapsed(groupKey: string): boolean {
 }
 
 function isGroupCollapsible(groupKey: string): boolean {
-  return groupKey === 'important' || groupKey === 'normal';
+  return groupKey === 'urgent' || groupKey === 'important' || groupKey === 'normal';
 }
 
 function toggleGroupCollapse(groupKey: string) {
@@ -963,19 +964,26 @@ onBeforeUnmount(() => {
 }
 
 .task-group__title {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: 12px auto;
   align-items: center;
   gap: 4px;
 }
 
 .task-group__chevron {
-  display: inline-block;
+  width: 12px;
+  height: 12px;
   color: var(--text-placeholder);
+  transform-origin: center;
   transition: transform 0.15s ease;
 }
 
 .task-group__chevron.collapsed {
   transform: rotate(-90deg);
+}
+
+.task-group__label {
+  line-height: 1;
 }
 
 .task-draggable.dragging,

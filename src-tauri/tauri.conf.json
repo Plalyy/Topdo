@@ -21,6 +21,7 @@
         "maxWidth": 500,
         "maxHeight": 900,
         "resizable": true,
+        "maximizable": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

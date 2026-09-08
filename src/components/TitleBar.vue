@@ -10,6 +10,7 @@
       data-no-drag
       @mouseenter="trafficHover = true"
       @mouseleave="trafficHover = false"
+      @mousedown.stop
       @dblclick.stop
     >
       <button class="traffic-btn close" type="button" title="关闭到托盘" @click.stop="$emit('close-to-tray')" @dblclick.stop>
@@ -36,7 +37,24 @@
       <ModeDropdown />
     </div>
 
-    <div class="titlebar-actions" data-no-drag @dblclick.stop>
+    <div class="titlebar-actions" data-no-drag @mousedown.stop @dblclick.stop>
+      <button
+        class="titlebar-action"
+        :class="{ active: marketActive }"
+        type="button"
+        :title="marketActive ? '返回任务页' : '查看行情'"
+        @click.stop="$emit('market')"
+        @dblclick.stop
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M2 12.75h12M3.25 10l2.55-2.7 2.05 1.8 4.9-5.35" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="3.25" cy="10" r=".85" fill="currentColor"/>
+          <circle cx="5.8" cy="7.3" r=".85" fill="currentColor"/>
+          <circle cx="7.85" cy="9.1" r=".85" fill="currentColor"/>
+          <circle cx="12.75" cy="3.75" r=".85" fill="currentColor"/>
+        </svg>
+      </button>
+
       <button
         class="titlebar-action"
         type="button"
@@ -92,25 +110,25 @@
 </template>
 
 <script setup lang="ts">
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import ModeDropdown from './ModeDropdown.vue';
 
 const props = defineProps<{
   alwaysOnTop: boolean;
   resolvedTheme: 'light' | 'dark';
+  marketActive: boolean;
 }>();
 
 const emit = defineEmits<{
   (event: 'settings'): void;
+  (event: 'market'): void;
   (event: 'toggle-pin'): void;
   (event: 'toggle-theme'): void;
   (event: 'mini'): void;
   (event: 'close-to-tray'): void;
-  (event: 'drag-end'): void;
 }>();
 
-const appWindow = getCurrentWindow();
 const trafficHover = ref(false);
 const windowFocused = ref(true);
 
@@ -122,8 +140,13 @@ function onBlur() {
   windowFocused.value = false;
 }
 
+function isInteractiveTarget(target: EventTarget | null) {
+  return target instanceof Element
+    && Boolean(target.closest('[data-no-drag], button, input, select, textarea, a, [role="button"]'));
+}
+
 function onDoubleClick(event: MouseEvent) {
-  if (event.target instanceof HTMLElement && event.target.closest('[data-no-drag]')) {
+  if (isInteractiveTarget(event.target)) {
     return;
   }
   emit('mini');
@@ -131,14 +154,14 @@ function onDoubleClick(event: MouseEvent) {
 
 async function onDragMouseDown(event: MouseEvent) {
   if (event.button !== 0) return;
-  if (event.target instanceof HTMLElement && event.target.closest('[data-no-drag]')) {
+  if (isInteractiveTarget(event.target)) {
     return;
   }
   event.preventDefault();
   try {
-    await appWindow.startDragging();
-  } finally {
-    emit('drag-end');
+    await invoke('drag_window_and_reconcile_top_dock');
+  } catch (error) {
+    console.warn('拖动窗口失败:', error);
   }
 }
 
@@ -177,7 +200,7 @@ onBeforeUnmount(() => {
   height: 38px;
   padding: 0 12px;
   display: grid;
-  grid-template-columns: 78px minmax(82px, 1fr) 90px;
+  grid-template-columns: 78px minmax(54px, 1fr) 118px;
   column-gap: 4px;
   align-items: center;
   background: transparent;
@@ -186,6 +209,8 @@ onBeforeUnmount(() => {
   z-index: 90;
   overflow: visible;
   flex-shrink: 0;
+  touch-action: none;
+  user-select: none;
 }
 
 .traffic-lights {
@@ -293,7 +318,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 340px) {
   .title-bar {
-    grid-template-columns: 72px minmax(70px, 1fr) 84px;
+    grid-template-columns: 70px minmax(44px, 1fr) 108px;
     padding: 0 8px;
     column-gap: 2px;
   }

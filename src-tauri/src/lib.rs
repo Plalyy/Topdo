@@ -14,13 +14,13 @@ use std::{
   path::{Path, PathBuf},
   str::FromStr,
   sync::{Mutex, OnceLock},
-  time::Duration,
+  time::{Duration, Instant},
 };
 use tauri::{
   Emitter,
   menu::{Menu, MenuItem},
   tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-  AppHandle, LogicalSize, Manager, PhysicalPosition, Position, Size, State, WebviewUrl,
+  AppHandle, LogicalSize, Manager, PhysicalPosition, Size, State, WebviewUrl,
   WebviewWindow, WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -31,6 +31,8 @@ const NORMAL_WIDTH: f64 = 320.0;
 const NORMAL_HEIGHT: f64 = 500.0;
 const NORMAL_MIN_WIDTH: f64 = 320.0;
 const NORMAL_MIN_HEIGHT: f64 = 300.0;
+const NORMAL_MAX_WIDTH: f64 = 500.0;
+const NORMAL_MAX_HEIGHT: f64 = 900.0;
 const MINI_PET_WIDTH: f64 = 80.0;
 const MINI_PET_HEIGHT: f64 = 80.0;
 const MINI_PILL_WIDTH: f64 = 176.0;
@@ -39,8 +41,14 @@ const FOCUS_MINI_MIN_WIDTH: f64 = 120.0;
 const FOCUS_MINI_MAX_WIDTH: f64 = 320.0;
 const FOCUS_MINI_HEIGHT: f64 = 44.0;
 const TOP_DOCK_COLLAPSED_HEIGHT: f64 = 12.0;
-const TOP_DOCK_SNAP_DISTANCE: i32 = 24;
+const TOP_DOCK_SNAP_DISTANCE: i32 = 40;
 const TOP_DOCK_DETACH_DISTANCE: i32 = 56;
+const TOP_DOCK_HOVER_HEIGHT: f64 = 48.0;
+const TOP_DOCK_HOVER_HORIZONTAL_PADDING: f64 = 8.0;
+const TOP_DOCK_HOVER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const TOP_DOCK_TRANSITION_DURATION: f64 = 0.12;
+const TOP_DOCK_EXPAND_GUARD: Duration = Duration::from_millis(500);
+const WINDOW_VISIBILITY_TOLERANCE: i64 = 1;
 const CONFIG_FILE_NAME: &str = "config.json";
 const DB_FILE_NAME: &str = "tasks.db";
 const TASK_ORDER_FILE_NAME: &str = "task_order.json";
@@ -53,6 +61,10 @@ const FEISHU_AGENT_HOST_FIELD: &str = "Agent Host";
 const FEISHU_AGENT_LABELS_FIELD: &str = "Agent 任务标签";
 const FEISHU_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const FEISHU_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const MARKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MARKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MARKET_MAX_ITEMS: usize = 12;
+const FUTU_INDEX_CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "macos")]
 const KCG_NORMAL_WINDOW_LEVEL_KEY: i32 = 4;
@@ -133,8 +145,11 @@ struct UiState {
   always_on_top: bool,
   top_docked: bool,
   top_dock_collapsed: bool,
+  top_dock_hover_armed: bool,
+  top_dock_collapse_pending: bool,
   top_dock_restore_width: f64,
   top_dock_restore_height: f64,
+  top_dock_collapse_blocked_until: Option<Instant>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -220,6 +235,41 @@ impl Default for SystemConfig {
   }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct MarketItemConfig {
+  #[serde(default)]
+  market: String,
+  #[serde(default)]
+  name: String,
+}
+
+fn default_market_items() -> Vec<MarketItemConfig> {
+  vec![
+    MarketItemConfig {
+      market: "币安".to_string(),
+      name: "SOXL/USDT".to_string(),
+    },
+    MarketItemConfig {
+      market: "币安".to_string(),
+      name: "SNDK/USDT".to_string(),
+    },
+  ]
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MarketConfig {
+  #[serde(default = "default_market_items")]
+  items: Vec<MarketItemConfig>,
+}
+
+impl Default for MarketConfig {
+  fn default() -> Self {
+    Self {
+      items: default_market_items(),
+    }
+  }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct PetPositionConfig {
   x: f64,
@@ -276,6 +326,8 @@ struct AppConfig {
   pet: PetConfig,
   #[serde(default)]
   system: SystemConfig,
+  #[serde(default)]
+  market: MarketConfig,
   #[serde(default = "default_sync_interval")]
   sync_interval: i64,
   #[serde(default)]
@@ -312,6 +364,112 @@ struct ConfigPayload {
   priority_important_value: String,
   priority_normal_value: String,
 }
+
+#[derive(Debug, Serialize)]
+struct MarketConfigPayload {
+  items: Vec<MarketItemConfig>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct MarketQuotePayload {
+  market: String,
+  name: String,
+  symbol: String,
+  resolved_market: String,
+  price: Option<String>,
+  change_percent: Option<String>,
+  high_price: Option<String>,
+  low_price: Option<String>,
+  quote_volume: Option<String>,
+  close_time: Option<i64>,
+  error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct MarketCandlePayload {
+  open_time: i64,
+  close_time: i64,
+  open: String,
+  high: String,
+  low: String,
+  close: String,
+  volume: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MarketKlinePayload {
+  market: String,
+  name: String,
+  symbol: String,
+  resolved_market: String,
+  interval: String,
+  candles: Vec<MarketCandlePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceTickerResponse {
+  #[serde(rename = "lastPrice")]
+  last_price: String,
+  #[serde(rename = "priceChangePercent")]
+  price_change_percent: String,
+  #[serde(rename = "highPrice")]
+  high_price: String,
+  #[serde(rename = "lowPrice")]
+  low_price: String,
+  #[serde(rename = "quoteVolume")]
+  quote_volume: String,
+  #[serde(rename = "closeTime")]
+  close_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceErrorResponse {
+  code: Option<i64>,
+  msg: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinanceMarketKind {
+  Auto,
+  Futures,
+  Spot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarketProvider {
+  Binance(BinanceMarketKind),
+  ChinaIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChinaIndexSpec {
+  symbol: &'static str,
+  provider_symbol: &'static str,
+  display_name: &'static str,
+  source: ChinaIndexSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChinaIndexSource {
+  Tencent,
+  Yahoo,
+}
+
+#[derive(Debug, Clone)]
+struct FutuMinutePoint {
+  time: i64,
+  price: f64,
+  volume: f64,
+}
+
+#[derive(Debug, Clone)]
+struct FutuIndexCache {
+  fetched_at: Instant,
+  quote: MarketQuotePayload,
+  minute_points: Vec<FutuMinutePoint>,
+}
+
+static FUTU_INDEX_CACHE: OnceLock<Mutex<Option<FutuIndexCache>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct FeishuFieldOption {
@@ -1096,6 +1254,7 @@ fn get_main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 
 fn apply_normal_mode(window: &WebviewWindow) -> tauri::Result<()> {
   window.set_resizable(true)?;
+  window.set_maximizable(false)?;
   window.set_min_size(Some(Size::Logical(LogicalSize::new(
     NORMAL_MIN_WIDTH,
     NORMAL_MIN_HEIGHT,
@@ -1108,6 +1267,7 @@ fn apply_normal_mode(window: &WebviewWindow) -> tauri::Result<()> {
 fn apply_panel_constraints(window: &WebviewWindow) -> tauri::Result<()> {
   window.set_max_size(Option::<Size>::None)?;
   window.set_resizable(true)?;
+  window.set_maximizable(false)?;
   window.set_min_size(Some(Size::Logical(LogicalSize::new(
     NORMAL_MIN_WIDTH,
     NORMAL_MIN_HEIGHT,
@@ -1115,15 +1275,201 @@ fn apply_panel_constraints(window: &WebviewWindow) -> tauri::Result<()> {
   Ok(())
 }
 
-fn apply_top_dock_size(window: &WebviewWindow, width: f64) -> tauri::Result<()> {
-  let size = Size::Logical(LogicalSize::new(width.max(NORMAL_MIN_WIDTH), TOP_DOCK_COLLAPSED_HEIGHT));
-  window.set_min_size(Option::<Size>::None)?;
-  window.set_max_size(Option::<Size>::None)?;
-  window.set_resizable(false)?;
-  window.set_size(size)?;
-  window.set_min_size(Some(size))?;
-  window.set_max_size(Some(size))?;
+fn normalize_initial_panel_size(window: &WebviewWindow) -> Result<(), String> {
+  let size = window
+    .outer_size()
+    .map_err(|err| format!("get initial window size failed: {err}"))?;
+  let scale_factor = window
+    .scale_factor()
+    .map_err(|err| format!("get initial scale factor failed: {err}"))?;
+  let logical_height = size.height as f64 / scale_factor;
+  if logical_height >= NORMAL_MIN_HEIGHT {
+    return Ok(());
+  }
+
+  apply_panel_constraints(window).map_err(|err| err.to_string())?;
+  window
+    .set_size(Size::Logical(LogicalSize::new(
+      NORMAL_WIDTH,
+      NORMAL_HEIGHT,
+    )))
+    .map_err(|err| format!("restore initial panel size failed: {err}"))?;
+  eprintln!(
+    "[Rust] normalized stale collapsed startup frame: physical_height={}, scale_factor={}",
+    size.height, scale_factor
+  );
   Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhysicalBounds {
+  x: i64,
+  y: i64,
+  width: i64,
+  height: i64,
+}
+
+fn overlap_area(left: PhysicalBounds, right: PhysicalBounds) -> i64 {
+  let width = (left.x + left.width).min(right.x + right.width) - left.x.max(right.x);
+  let height = (left.y + left.height).min(right.y + right.height) - left.y.max(right.y);
+  width.max(0) * height.max(0)
+}
+
+fn corrected_window_position(
+  window: PhysicalBounds,
+  monitors: &[PhysicalBounds],
+) -> Option<PhysicalPosition<i32>> {
+  if window.width <= 0 || window.height <= 0 || monitors.is_empty() {
+    return None;
+  }
+
+  let window_area = window.width.saturating_mul(window.height);
+  let visible_area = monitors
+    .iter()
+    .map(|monitor| overlap_area(window, *monitor))
+    .sum::<i64>();
+  if window_area.saturating_sub(visible_area) <= WINDOW_VISIBILITY_TOLERANCE {
+    return None;
+  }
+
+  let target = monitors
+    .iter()
+    .max_by_key(|monitor| overlap_area(window, **monitor))?;
+  let max_x = target.x + (target.width - window.width).max(0);
+  let max_y = target.y + (target.height - window.height).max(0);
+  let x = window.x.clamp(target.x, max_x);
+  let y = window.y.clamp(target.y, max_y);
+  Some(PhysicalPosition::new(x as i32, y as i32))
+}
+
+fn ensure_window_visible(window: &WebviewWindow, reason: &str) -> Result<bool, String> {
+  let position = window
+    .outer_position()
+    .map_err(|err| format!("get window position failed: {err}"))?;
+  let size = window
+    .outer_size()
+    .map_err(|err| format!("get window size failed: {err}"))?;
+  let monitors = window
+    .available_monitors()
+    .map_err(|err| format!("get available monitors failed: {err}"))?
+    .into_iter()
+    .map(|monitor| PhysicalBounds {
+      x: monitor.position().x as i64,
+      y: monitor.position().y as i64,
+      width: monitor.size().width as i64,
+      height: monitor.size().height as i64,
+    })
+    .collect::<Vec<_>>();
+  let bounds = PhysicalBounds {
+    x: position.x as i64,
+    y: position.y as i64,
+    width: size.width as i64,
+    height: size.height as i64,
+  };
+  let Some(corrected) = corrected_window_position(bounds, &monitors) else {
+    return Ok(false);
+  };
+
+  window
+    .set_position(corrected)
+    .map_err(|err| format!("restore visible window position failed: {err}"))?;
+  eprintln!(
+    "[Rust] restored window visibility: reason={reason}, from=({}, {}), to=({}, {}), size=({}, {})",
+    position.x, position.y, corrected.x, corrected.y, size.width, size.height
+  );
+  Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn set_native_top_dock_frame(
+  window: &WebviewWindow,
+  width: f64,
+  height: f64,
+  distance_from_top: i32,
+  scale_factor: f64,
+  animate: bool,
+) -> Result<(), String> {
+  use cocoa::{
+    appkit::NSWindow,
+    base::{id, NO, YES},
+    foundation::{NSPoint, NSRect, NSSize},
+  };
+  use objc::{msg_send, sel, sel_impl};
+
+  let ns_window = window
+    .ns_window()
+    .map_err(|err| format!("ns_window unavailable: {err}"))? as usize;
+  let app = window.app_handle().clone();
+  let width = width.max(NORMAL_MIN_WIDTH);
+  let height = height.max(TOP_DOCK_COLLAPSED_HEIGHT);
+  let top_offset = distance_from_top as f64 / scale_factor;
+
+  app
+    .run_on_main_thread(move || unsafe {
+      let ns_window = ns_window as id;
+      let frame = ns_window.frame();
+      let target_top = frame.origin.y + frame.size.height + top_offset;
+      let target_frame = NSRect::new(
+        NSPoint::new(frame.origin.x, target_top - height),
+        NSSize::new(width, height),
+      );
+      let minimum_size = if height <= TOP_DOCK_COLLAPSED_HEIGHT {
+        NSSize::new(0.0, 0.0)
+      } else {
+        NSSize::new(NORMAL_MIN_WIDTH, NORMAL_MIN_HEIGHT)
+      };
+      ns_window.setMinSize_(minimum_size);
+      eprintln!(
+        "[Rust] native top dock frame applying: current=({}, {}, {}, {}), target=({}, {}, {}, {}), animate={animate}",
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+        target_frame.origin.x,
+        target_frame.origin.y,
+        target_frame.size.width,
+        target_frame.size.height,
+      );
+      if animate {
+        let animation_context_class =
+          objc::runtime::Class::get("NSAnimationContext").expect("NSAnimationContext unavailable");
+        let _: () = msg_send![animation_context_class, beginGrouping];
+        let animation_context: id = msg_send![animation_context_class, currentContext];
+        let _: () = msg_send![animation_context, setDuration: TOP_DOCK_TRANSITION_DURATION];
+        let animator: id = msg_send![ns_window, animator];
+        let _: () = msg_send![animator, setFrame: target_frame display: YES];
+        let _: () = msg_send![animation_context_class, endGrouping];
+        eprintln!(
+          "[Rust] native top dock frame scheduled: duration={}ms",
+          TOP_DOCK_TRANSITION_DURATION * 1_000.0,
+        );
+      } else {
+        ns_window.setFrame_display_animate_(target_frame, YES, NO);
+        let applied_frame = ns_window.frame();
+        eprintln!(
+          "[Rust] native top dock frame applied: actual=({}, {}, {}, {})",
+          applied_frame.origin.x,
+          applied_frame.origin.y,
+          applied_frame.size.width,
+          applied_frame.size.height,
+        );
+      }
+    })
+    .map_err(|err| format!("schedule top dock frame failed: {err}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_native_top_dock_frame(
+  window: &WebviewWindow,
+  width: f64,
+  height: f64,
+  _distance_from_top: i32,
+  _scale_factor: f64,
+  _animate: bool,
+) -> Result<(), String> {
+  window
+    .set_size(Size::Logical(LogicalSize::new(width, height)))
+    .map_err(|err| err.to_string())
 }
 
 fn current_monitor_top(window: &WebviewWindow) -> Result<i32, String> {
@@ -1132,7 +1478,7 @@ fn current_monitor_top(window: &WebviewWindow) -> Result<i32, String> {
     .map_err(|err| format!("get current monitor failed: {err}"))?
     .or_else(|| window.primary_monitor().ok().flatten())
     .ok_or_else(|| "current monitor unavailable".to_string())?;
-  Ok(monitor.work_area().position.y)
+  Ok(monitor.position().y)
 }
 
 fn window_top_distance(window: &WebviewWindow) -> Result<(PhysicalPosition<i32>, i32), String> {
@@ -1141,6 +1487,210 @@ fn window_top_distance(window: &WebviewWindow) -> Result<(PhysicalPosition<i32>,
     .map_err(|err| format!("get window position failed: {err}"))?;
   let monitor_top = current_monitor_top(window)?;
   Ok((position, position.y - monitor_top))
+}
+
+fn scaled_top_dock_distance(distance: i32, scale_factor: f64) -> i32 {
+  (distance as f64 * scale_factor).round() as i32
+}
+
+fn should_snap_top_dock(
+  mini_mode: bool,
+  top_docked: bool,
+  distance_from_top: i32,
+  scale_factor: f64,
+) -> bool {
+  !mini_mode
+    && !top_docked
+    && distance_from_top <= scaled_top_dock_distance(TOP_DOCK_SNAP_DISTANCE, scale_factor)
+}
+
+fn cursor_inside_top_dock_hotspot(
+  cursor: PhysicalPosition<f64>,
+  position: PhysicalPosition<i32>,
+  width: u32,
+  monitor_top: i32,
+  scale_factor: f64,
+) -> bool {
+  let horizontal_padding = TOP_DOCK_HOVER_HORIZONTAL_PADDING * scale_factor;
+  let hotspot_height = TOP_DOCK_HOVER_HEIGHT * scale_factor;
+  cursor.x >= position.x as f64 - horizontal_padding
+    && cursor.x <= position.x as f64 + width as f64 + horizontal_padding
+    && cursor.y >= monitor_top as f64
+    && cursor.y <= monitor_top as f64 + hotspot_height
+}
+
+fn cursor_inside_window_bounds(
+  cursor: PhysicalPosition<f64>,
+  position: PhysicalPosition<i32>,
+  size: tauri::PhysicalSize<u32>,
+) -> bool {
+  cursor.x >= position.x as f64
+    && cursor.x <= position.x as f64 + size.width as f64
+    && cursor.y >= position.y as f64
+    && cursor.y <= position.y as f64 + size.height as f64
+}
+
+fn start_top_dock_hover_monitor(app: AppHandle) {
+  tauri::async_runtime::spawn(async move {
+    loop {
+      tokio::time::sleep(TOP_DOCK_HOVER_POLL_INTERVAL).await;
+
+      let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        continue;
+      };
+      let state_handle = app.state::<Mutex<UiState>>();
+      let (collapsed, armed, collapse_pending, collapse_blocked_until) =
+        match state_handle.try_lock() {
+        Ok(state) => (
+          state.top_dock_collapsed,
+          state.top_dock_hover_armed,
+          state.top_dock_collapse_pending,
+          state.top_dock_collapse_blocked_until,
+        ),
+        Err(_) => continue,
+      };
+      if !collapsed && !collapse_pending {
+        continue;
+      }
+
+      let Ok(cursor) = window.cursor_position() else {
+        continue;
+      };
+      let Ok(position) = window.outer_position() else {
+        continue;
+      };
+      let Ok(size) = window.outer_size() else {
+        continue;
+      };
+      let Ok(scale_factor) = window.scale_factor() else {
+        continue;
+      };
+      let Ok(monitor_top) = current_monitor_top(&window) else {
+        continue;
+      };
+      let inside = cursor_inside_top_dock_hotspot(
+        cursor,
+        position,
+        size.width,
+        monitor_top,
+        scale_factor,
+      );
+      let inside_window = cursor_inside_window_bounds(cursor, position, size);
+
+      if collapse_pending && !collapsed {
+        if inside_window
+          || inside
+          || collapse_blocked_until.is_some_and(|deadline| Instant::now() < deadline)
+        {
+          continue;
+        }
+
+        let dimensions = match state_handle.try_lock() {
+          Ok(mut state) if state.top_dock_collapse_pending && !state.top_dock_collapsed => {
+            state.top_dock_collapse_pending = false;
+            state.top_dock_collapsed = true;
+            state.top_dock_hover_armed = true;
+            state.top_dock_collapse_blocked_until = None;
+            Some((
+              state.top_dock_restore_width,
+              WindowStatePayload {
+                mini_mode: state.mini_mode,
+                always_on_top: state.always_on_top,
+                top_docked: state.top_docked,
+                top_dock_collapsed: state.top_dock_collapsed,
+              },
+            ))
+          }
+          _ => None,
+        };
+        let Some((width, payload)) = dimensions else {
+          continue;
+        };
+        let Ok((_, distance_from_top)) = window_top_distance(&window) else {
+          continue;
+        };
+        if let Err(err) = set_native_top_dock_frame(
+          &window,
+          width,
+          TOP_DOCK_COLLAPSED_HEIGHT,
+          distance_from_top,
+          scale_factor,
+          true,
+        ) {
+          eprintln!("[Rust] native top dock pending collapse failed: {err}");
+          continue;
+        }
+        eprintln!("[Rust] native top dock pending collapse applied");
+        let _ = app.emit("top-dock-state-changed", payload);
+        continue;
+      }
+
+      if !armed {
+        if !inside {
+          if let Ok(mut state) = state_handle.try_lock() {
+            if state.top_dock_collapsed {
+              state.top_dock_hover_armed = true;
+              eprintln!("[Rust] native top dock hover armed after cursor left hotspot");
+            }
+          }
+        }
+        continue;
+      }
+      if !inside {
+        continue;
+      }
+
+      let dimensions = match state_handle.try_lock() {
+        Ok(mut state) if state.top_dock_collapsed && state.top_dock_hover_armed => {
+          state.top_dock_collapsed = false;
+          state.top_dock_hover_armed = false;
+          state.top_dock_collapse_pending = false;
+          state.top_dock_collapse_blocked_until =
+            Some(Instant::now() + TOP_DOCK_EXPAND_GUARD);
+          Some((
+            state.top_dock_restore_width,
+            state.top_dock_restore_height,
+            WindowStatePayload {
+              mini_mode: state.mini_mode,
+              always_on_top: state.always_on_top,
+              top_docked: state.top_docked,
+              top_dock_collapsed: state.top_dock_collapsed,
+            },
+          ))
+        }
+        _ => None,
+      };
+      let Some((width, height, payload)) = dimensions else {
+        continue;
+      };
+
+      eprintln!(
+        "[Rust] native top dock hover expanding: cursor=({}, {}), window=({}, {}), width={}, monitor_top={}, scale_factor={}",
+        cursor.x,
+        cursor.y,
+        position.x,
+        position.y,
+        size.width,
+        monitor_top,
+        scale_factor
+      );
+      let Ok((_, distance_from_top)) = window_top_distance(&window) else {
+        continue;
+      };
+      if let Err(err) = set_native_top_dock_frame(
+        &window,
+        width,
+        height,
+        distance_from_top,
+        scale_factor,
+        true,
+      ) {
+        eprintln!("[Rust] native top dock hover expand failed: {err}");
+        continue;
+      }
+      let _ = app.emit("top-dock-state-changed", payload);
+    }
+  });
 }
 
 fn apply_mini_mode(app: &AppHandle, window: &WebviewWindow) -> tauri::Result<()> {
@@ -1255,6 +1805,97 @@ fn apply_window_traits_native(
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn set_native_window_movable(window: &WebviewWindow, movable: bool) -> Result<(), String> {
+  use cocoa::{
+    appkit::NSWindow,
+    base::{id, NO, YES},
+  };
+
+  let ns_window_ptr = window
+    .ns_window()
+    .map_err(|err| format!("ns_window unavailable: {err}"))?;
+  let ns_window: id = ns_window_ptr as id;
+  let value = if movable { YES } else { NO };
+  unsafe {
+    ns_window.setMovable_(value);
+    ns_window.setMovableByWindowBackground_(NO);
+  }
+  Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_native_window_movable(_window: &WebviewWindow, _movable: bool) -> Result<(), String> {
+  Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn track_native_window_drag(window: &WebviewWindow) -> Result<(), String> {
+  use cocoa::{
+    appkit::{NSEvent, NSEventMask, NSEventType, NSWindow, NSApp, NSApplication},
+    base::{id, YES},
+    foundation::NSDate,
+  };
+
+  #[link(name = "AppKit", kind = "framework")]
+  unsafe extern "C" {
+    static NSEventTrackingRunLoopMode: id;
+  }
+
+  let ns_window = window
+    .ns_window()
+    .map_err(|err| format!("ns_window unavailable: {err}"))? as usize;
+  let app = window.app_handle().clone();
+  let (sender, receiver) = tokio::sync::oneshot::channel();
+
+  app
+    .run_on_main_thread(move || {
+      let result = unsafe {
+        let ns_window = ns_window as id;
+        let ns_app = NSApp();
+        let start_mouse = NSEvent::mouseLocation(ns_window);
+        let start_frame = ns_window.frame();
+        let mask =
+          NSEventMask::NSLeftMouseDraggedMask | NSEventMask::NSLeftMouseUpMask;
+
+        loop {
+          let event = ns_app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+            mask.bits() as _,
+            NSDate::distantFuture(ns_window),
+            NSEventTrackingRunLoopMode,
+            YES,
+          );
+          if event.is_null() {
+            break Err("native drag ended without a mouse event".to_string());
+          }
+
+          match event.eventType() {
+            NSEventType::NSLeftMouseDragged => {
+              let mouse = NSEvent::mouseLocation(event);
+              ns_window.setFrameOrigin_(cocoa::foundation::NSPoint::new(
+                start_frame.origin.x + mouse.x - start_mouse.x,
+                start_frame.origin.y + mouse.y - start_mouse.y,
+              ));
+            }
+            NSEventType::NSLeftMouseUp => break Ok(()),
+            _ => {}
+          }
+        }
+      };
+      let _ = sender.send(result);
+    })
+    .map_err(|err| format!("schedule native drag failed: {err}"))?;
+
+  receiver
+    .await
+    .map_err(|err| format!("native drag result unavailable: {err}"))?
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn track_native_window_drag(window: &WebviewWindow) -> Result<(), String> {
+  window.start_dragging().map_err(|err| err.to_string())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn apply_window_traits_native(
   _window: &WebviewWindow,
@@ -1298,6 +1939,7 @@ fn toggle_window_visibility(app: &AppHandle) -> tauri::Result<()> {
       let _ = apply_window_traits(&window, pinned, false, "toggle_window_visibility:pre-show");
       window.unminimize()?;
       window.show()?;
+      let _ = ensure_window_visible(&window, "toggle_window_visibility");
       window.set_focus()?;
       let _ = apply_window_traits(&window, pinned, true, "toggle_window_visibility:post-show");
       let _ = app.emit(
@@ -1461,6 +2103,24 @@ fn normalize_loaded_config(mut cfg: AppConfig) -> AppConfig {
   if cfg.system.backup_retention_days <= 0 {
     cfg.system.backup_retention_days = default_backup_retention_days();
   }
+  cfg.market.items = cfg
+    .market
+    .items
+    .into_iter()
+    .take(MARKET_MAX_ITEMS)
+    .filter_map(|item| {
+      let market = item.market.trim().to_string();
+      let name = item.name.trim().to_uppercase();
+      if market.is_empty() || name.is_empty() {
+        None
+      } else {
+        Some(MarketItemConfig { market, name })
+      }
+    })
+    .collect();
+  if cfg.market.items.is_empty() {
+    cfg.market.items = default_market_items();
+  }
   cfg.pet.window_mode = normalize_window_mode(&cfg.pet.window_mode);
   cfg.pet.daily_progress_level = normalize_daily_progress_level(cfg.pet.daily_progress_level);
   cfg
@@ -1477,6 +2137,7 @@ fn default_app_config() -> AppConfig {
     },
     pet: PetConfig::default(),
     system: SystemConfig::default(),
+    market: MarketConfig::default(),
     sync_interval: 30,
     created_at: now_iso(),
     app_mode: String::new(),
@@ -3555,6 +4216,7 @@ fn init_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
           let _ = set_window_mode_internal(&app_for_menu, "panel");
           let _ = window.unminimize();
           let _ = window.show();
+          let _ = ensure_window_visible(&window, "tray_menu:show");
           let _ = window.set_focus();
           let pinned = app_for_menu
             .state::<Mutex<UiState>>()
@@ -3569,6 +4231,7 @@ fn init_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
           let _ = set_window_mode_internal(&app_for_menu, "cat");
           let _ = window.unminimize();
           let _ = window.show();
+          let _ = ensure_window_visible(&window, "tray_menu:mini");
           let _ = window.set_focus();
           let pinned = app_for_menu
             .state::<Mutex<UiState>>()
@@ -3593,6 +4256,7 @@ fn init_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(window) = app_for_tray.get_webview_window(MAIN_WINDOW_LABEL) {
           let _ = window.unminimize();
           let _ = window.show();
+          let _ = ensure_window_visible(&window, "tray_icon");
           let _ = window.set_focus();
         }
       }
@@ -3810,12 +4474,14 @@ fn set_window_mode_internal_with_variant(
   }
   state.top_docked = false;
   state.top_dock_collapsed = false;
+  state.top_dock_collapse_pending = false;
   apply_window_traits(
     &window,
     state.always_on_top,
     should_include_native_traits("set_window_mode_internal"),
     "set_window_mode_internal",
   )?;
+  set_native_window_movable(&window, state.mini_mode)?;
 
   let payload = WindowModeChangedPayload {
     mode: normalized_mode.clone(),
@@ -3973,6 +4639,947 @@ fn init_global_shortcut(app: &AppHandle) -> Result<(), Box<dyn std::error::Error
   Ok(())
 }
 
+fn normalize_market_symbol(name: &str) -> Result<String, String> {
+  let symbol = name
+    .chars()
+    .filter(|character| character.is_ascii_alphanumeric())
+    .collect::<String>()
+    .to_uppercase();
+  if symbol.len() < 3 || symbol.len() > 30 {
+    return Err("名称需包含有效交易对，例如 BTC/USDT".to_string());
+  }
+  Ok(symbol)
+}
+
+fn parse_binance_market_kind(market: &str) -> Result<BinanceMarketKind, String> {
+  let normalized = market
+    .trim()
+    .to_lowercase()
+    .replace([' ', '-', '_'], "");
+  match normalized.as_str() {
+    "币安" | "binance" => Ok(BinanceMarketKind::Auto),
+    "币安合约" | "币安u本位" | "币安u本位合约" | "binancefutures" | "binanceusdm" => {
+      Ok(BinanceMarketKind::Futures)
+    }
+    "币安现货" | "binancespot" => Ok(BinanceMarketKind::Spot),
+    _ => Err(format!(
+      "暂不支持市场「{}」，可填写币安、币安合约或币安现货",
+      market.trim()
+    )),
+  }
+}
+
+fn parse_market_provider(market: &str) -> Result<MarketProvider, String> {
+  if let Ok(kind) = parse_binance_market_kind(market) {
+    return Ok(MarketProvider::Binance(kind));
+  }
+  let normalized = market
+    .trim()
+    .to_lowercase()
+    .replace([' ', '-', '_'], "");
+  match normalized.as_str() {
+    "a股" | "a股指数" | "沪深指数" | "中证指数" | "chinaindex" => {
+      Ok(MarketProvider::ChinaIndex)
+    }
+    _ => Err(format!(
+      "暂不支持市场「{}」，可填写币安、币安合约、币安现货或 A股指数",
+      market.trim()
+    )),
+  }
+}
+
+fn resolve_china_index(name: &str) -> Result<ChinaIndexSpec, String> {
+  let normalized = name
+    .trim()
+    .to_lowercase()
+    .replace([' ', '-', '_', '/', '（', '）', '(', ')'], "");
+  match normalized.as_str() {
+    "上证" | "上证指数" | "沪指" | "000001" | "sh000001" => Ok(ChinaIndexSpec {
+      symbol: "000001",
+      provider_symbol: "sh000001",
+      display_name: "上证指数",
+      source: ChinaIndexSource::Tencent,
+    }),
+    "创业板" | "创业板指" | "创业板指数" | "399006" | "sz399006" => {
+      Ok(ChinaIndexSpec {
+        symbol: "399006",
+        provider_symbol: "sz399006",
+        display_name: "创业板指",
+        source: ChinaIndexSource::Tencent,
+      })
+    }
+    "科创板" | "科创50" | "科创板50" | "科创板指数" | "000688" | "sh000688" => {
+      Ok(ChinaIndexSpec {
+        symbol: "000688",
+        provider_symbol: "sh000688",
+        display_name: "科创50",
+        source: ChinaIndexSource::Tencent,
+      })
+    }
+    "红利低波" | "红利低波指数" | "红利低波100" | "中证红利低波动100"
+    | "中证红利低波动100指数" | "930955" | "930955.ss" => Ok(ChinaIndexSpec {
+      symbol: "930955",
+      provider_symbol: "930955.SS",
+      display_name: "红利低波100",
+      source: ChinaIndexSource::Yahoo,
+    }),
+    _ => Err(format!(
+      "暂不支持 A 股指数「{}」，可填写上证指数、创业板指、科创50或红利低波100",
+      name.trim()
+    )),
+  }
+}
+
+fn normalize_kline_interval(interval: &str) -> Result<&'static str, String> {
+  match interval.trim().to_lowercase().as_str() {
+    "5m" | "5min" | "5分钟" => Ok("5m"),
+    "15m" | "15min" | "15分钟" => Ok("15m"),
+    _ => Err("K 线周期仅支持 5m 或 15m".to_string()),
+  }
+}
+
+fn binance_market_name(kind: BinanceMarketKind) -> &'static str {
+  match kind {
+    BinanceMarketKind::Auto => "币安",
+    BinanceMarketKind::Futures => "币安 U 本位",
+    BinanceMarketKind::Spot => "币安现货",
+  }
+}
+
+fn binance_ticker_url(kind: BinanceMarketKind, symbol: &str) -> String {
+  let base = match kind {
+    BinanceMarketKind::Futures => "https://fapi.binance.com/fapi/v1/ticker/24hr",
+    BinanceMarketKind::Spot | BinanceMarketKind::Auto => {
+      "https://api.binance.com/api/v3/ticker/24hr"
+    }
+  };
+  format!("{base}?symbol={symbol}")
+}
+
+fn binance_kline_url(
+  kind: BinanceMarketKind,
+  symbol: &str,
+  interval: &str,
+  limit: usize,
+) -> String {
+  let base = match kind {
+    BinanceMarketKind::Futures => "https://fapi.binance.com/fapi/v1/klines",
+    BinanceMarketKind::Spot | BinanceMarketKind::Auto => {
+      "https://api.binance.com/api/v3/klines"
+    }
+  };
+  format!("{base}?symbol={symbol}&interval={interval}&limit={limit}")
+}
+
+fn parse_binance_candles(body: &str) -> Result<Vec<MarketCandlePayload>, String> {
+  let rows = serde_json::from_str::<Vec<Vec<Value>>>(body)
+    .map_err(|error| format!("解析 K 线响应失败：{error}"))?;
+  rows
+    .into_iter()
+    .map(|row| {
+      if row.len() < 7 {
+        return Err("K 线响应字段不完整".to_string());
+      }
+      let number = |index: usize, name: &str| {
+        row[index]
+          .as_i64()
+          .ok_or_else(|| format!("K 线{name}字段无效"))
+      };
+      let text = |index: usize, name: &str| {
+        row[index]
+          .as_str()
+          .map(str::to_string)
+          .ok_or_else(|| format!("K 线{name}字段无效"))
+      };
+      Ok(MarketCandlePayload {
+        open_time: number(0, "开始时间")?,
+        open: text(1, "开盘价")?,
+        high: text(2, "最高价")?,
+        low: text(3, "最低价")?,
+        close: text(4, "收盘价")?,
+        volume: text(5, "成交量")?,
+        close_time: number(6, "结束时间")?,
+      })
+    })
+    .collect()
+}
+
+async fn fetch_binance_klines(
+  client: &reqwest::Client,
+  kind: BinanceMarketKind,
+  symbol: &str,
+  interval: &str,
+  limit: usize,
+) -> Result<Vec<MarketCandlePayload>, String> {
+  let response = client
+    .get(binance_kline_url(kind, symbol, interval, limit))
+    .send()
+    .await
+    .map_err(|error| format!("{} K 线请求失败：{error}", binance_market_name(kind)))?;
+  let status = response.status();
+  let body = response
+    .text()
+    .await
+    .map_err(|error| format!("读取{} K 线失败：{error}", binance_market_name(kind)))?;
+  if !status.is_success() {
+    let detail = serde_json::from_str::<BinanceErrorResponse>(&body)
+      .ok()
+      .and_then(|payload| payload.msg)
+      .unwrap_or_else(|| format!("HTTP {status}"));
+    return Err(detail);
+  }
+  parse_binance_candles(&body)
+}
+
+async fn fetch_binance_ticker(
+  client: &reqwest::Client,
+  kind: BinanceMarketKind,
+  symbol: &str,
+) -> Result<BinanceTickerResponse, String> {
+  let response = client
+    .get(binance_ticker_url(kind, symbol))
+    .send()
+    .await
+    .map_err(|error| format!("{}请求失败：{error}", binance_market_name(kind)))?;
+  let status = response.status();
+  let body = response
+    .text()
+    .await
+    .map_err(|error| format!("读取{}响应失败：{error}", binance_market_name(kind)))?;
+  if !status.is_success() {
+    let detail = serde_json::from_str::<BinanceErrorResponse>(&body)
+      .ok()
+      .and_then(|payload| {
+        payload.msg.map(|message| match payload.code {
+          Some(code) => format!("{message} ({code})"),
+          None => message,
+        })
+      })
+      .unwrap_or_else(|| format!("HTTP {status}"));
+    return Err(detail);
+  }
+  serde_json::from_str::<BinanceTickerResponse>(&body)
+    .map_err(|error| format!("解析{}行情失败：{error}", binance_market_name(kind)))
+}
+
+fn tencent_kline_url(spec: ChinaIndexSpec, interval: &str, limit: usize) -> String {
+  format!(
+    "https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={},m{},,{}",
+    spec.provider_symbol,
+    interval.trim_end_matches('m'),
+    limit
+  )
+}
+
+fn parse_tencent_quote(body: &str, spec: ChinaIndexSpec) -> Result<MarketQuotePayload, String> {
+  let payload: Value =
+    serde_json::from_str(body).map_err(|error| format!("解析腾讯指数行情失败：{error}"))?;
+  let quote = payload
+    .pointer(&format!(
+      "/data/{}/qt/{}",
+      spec.provider_symbol, spec.provider_symbol
+    ))
+    .and_then(Value::as_array)
+    .ok_or_else(|| "腾讯暂未返回该指数行情".to_string())?;
+  let field = |index: usize| {
+    quote
+      .get(index)
+      .and_then(Value::as_str)
+      .filter(|value| !value.is_empty())
+      .map(str::to_string)
+  };
+  let close_time = field(30)
+    .and_then(|value| parse_china_market_time(&value).ok())
+    .or_else(|| {
+      now_unix_seconds()
+        .parse::<i64>()
+        .ok()
+        .and_then(|value| value.checked_mul(1_000))
+    });
+  Ok(MarketQuotePayload {
+    market: "A股指数".to_string(),
+    name: spec.display_name.to_string(),
+    symbol: spec.symbol.to_string(),
+    resolved_market: "A股指数 · 腾讯".to_string(),
+    price: field(3),
+    change_percent: field(32),
+    high_price: field(33),
+    low_price: field(34),
+    quote_volume: field(37),
+    close_time,
+    error: None,
+  })
+}
+
+fn parse_china_market_time(value: &str) -> Result<i64, String> {
+  if value.len() < 12 {
+    return Err("指数时间字段无效".to_string());
+  }
+  let year = value[0..4]
+    .parse::<i32>()
+    .map_err(|_| "指数年份字段无效".to_string())?;
+  let month = value[4..6]
+    .parse::<i32>()
+    .map_err(|_| "指数月份字段无效".to_string())?;
+  let day = value[6..8]
+    .parse::<i32>()
+    .map_err(|_| "指数日期字段无效".to_string())?;
+  let hour = value[8..10]
+    .parse::<i32>()
+    .map_err(|_| "指数小时字段无效".to_string())?;
+  let minute = value[10..12]
+    .parse::<i32>()
+    .map_err(|_| "指数分钟字段无效".to_string())?;
+  let second = if value.len() >= 14 {
+    value[12..14].parse::<i32>().unwrap_or(0)
+  } else {
+    0
+  };
+  let days = days_from_civil(year, month, day);
+  Ok((days * 86_400 + (hour - 8) as i64 * 3_600 + minute as i64 * 60 + second as i64) * 1_000)
+}
+
+fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
+  let adjusted_year = year - i32::from(month <= 2);
+  let era = if adjusted_year >= 0 {
+    adjusted_year
+  } else {
+    adjusted_year - 399
+  } / 400;
+  let year_of_era = adjusted_year - era * 400;
+  let adjusted_month = month + if month > 2 { -3 } else { 9 };
+  let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+  let day_of_era =
+    year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+  era as i64 * 146_097 + day_of_era as i64 - 719_468
+}
+
+fn parse_tencent_candles(
+  body: &str,
+  spec: ChinaIndexSpec,
+  interval: &str,
+) -> Result<Vec<MarketCandlePayload>, String> {
+  let payload: Value =
+    serde_json::from_str(body).map_err(|error| format!("解析腾讯指数 K 线失败：{error}"))?;
+  let rows = payload
+    .pointer(&format!(
+      "/data/{}/m{}",
+      spec.provider_symbol,
+      interval.trim_end_matches('m')
+    ))
+    .and_then(Value::as_array)
+    .ok_or_else(|| "腾讯暂未返回该指数 K 线".to_string())?;
+  let interval_ms = if interval == "15m" { 900_000 } else { 300_000 };
+  rows
+    .iter()
+    .map(|row| {
+      let values = row
+        .as_array()
+        .ok_or_else(|| "指数 K 线响应字段无效".to_string())?;
+      let text = |index: usize, name: &str| {
+        values
+          .get(index)
+          .and_then(Value::as_str)
+          .filter(|value| !value.is_empty())
+          .map(str::to_string)
+          .ok_or_else(|| format!("指数 K 线{name}字段无效"))
+      };
+      let open_time = parse_china_market_time(&text(0, "时间")?)?;
+      Ok(MarketCandlePayload {
+        open_time,
+        close_time: open_time + interval_ms - 1,
+        open: text(1, "开盘价")?,
+        close: text(2, "收盘价")?,
+        high: text(3, "最高价")?,
+        low: text(4, "最低价")?,
+        volume: text(5, "成交量")?,
+      })
+    })
+    .collect()
+}
+
+async fn fetch_tencent_index(
+  client: &reqwest::Client,
+  spec: ChinaIndexSpec,
+  interval: &str,
+  limit: usize,
+) -> Result<(MarketQuotePayload, Vec<MarketCandlePayload>), String> {
+  let response = client
+    .get(tencent_kline_url(spec, interval, limit))
+    .send()
+    .await
+    .map_err(|error| format!("腾讯指数请求失败：{error}"))?;
+  let status = response.status();
+  let body = response
+    .text()
+    .await
+    .map_err(|error| format!("读取腾讯指数响应失败：{error}"))?;
+  if !status.is_success() {
+    return Err(format!("腾讯指数请求失败：HTTP {status}"));
+  }
+  Ok((
+    parse_tencent_quote(&body, spec)?,
+    parse_tencent_candles(&body, spec, interval)?,
+  ))
+}
+
+fn yahoo_chart_url(spec: ChinaIndexSpec, interval: &str) -> String {
+  format!(
+    "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval={interval}&range=5d",
+    spec.provider_symbol
+  )
+}
+
+fn yahoo_number(value: Option<&Value>) -> Option<String> {
+  value
+    .and_then(Value::as_f64)
+    .filter(|value| value.is_finite())
+    .map(|value| value.to_string())
+}
+
+fn parse_yahoo_chart(
+  body: &str,
+  spec: ChinaIndexSpec,
+  interval: &str,
+) -> Result<(MarketQuotePayload, Vec<MarketCandlePayload>), String> {
+  let payload: Value =
+    serde_json::from_str(body).map_err(|error| format!("解析 Yahoo 指数行情失败：{error}"))?;
+  let result = payload
+    .pointer("/chart/result/0")
+    .ok_or_else(|| "Yahoo 暂未返回该指数行情".to_string())?;
+  let meta = result
+    .get("meta")
+    .ok_or_else(|| "Yahoo 指数行情字段不完整".to_string())?;
+  let previous = meta
+    .get("chartPreviousClose")
+    .or_else(|| meta.get("previousClose"))
+    .and_then(Value::as_f64);
+  let price = meta.get("regularMarketPrice").and_then(Value::as_f64);
+  let change_percent = meta
+    .get("regularMarketChangePercent")
+    .and_then(Value::as_f64)
+    .or_else(|| match (price, previous) {
+      (Some(price), Some(previous)) if previous != 0.0 => {
+        Some((price - previous) / previous * 100.0)
+      }
+      _ => None,
+    })
+    .map(|value| value.to_string());
+  let timestamps = result
+    .get("timestamp")
+    .and_then(Value::as_array)
+    .ok_or_else(|| "Yahoo 指数 K 线时间字段不完整".to_string())?;
+  let quote = result
+    .pointer("/indicators/quote/0")
+    .ok_or_else(|| "Yahoo 指数 K 线字段不完整".to_string())?;
+  let opens = quote.get("open").and_then(Value::as_array);
+  let highs = quote.get("high").and_then(Value::as_array);
+  let lows = quote.get("low").and_then(Value::as_array);
+  let closes = quote.get("close").and_then(Value::as_array);
+  let volumes = quote.get("volume").and_then(Value::as_array);
+  let interval_ms = if interval == "15m" { 900_000 } else { 300_000 };
+  let candles = timestamps
+    .iter()
+    .enumerate()
+    .filter_map(|(index, timestamp)| {
+      let open_time = timestamp.as_i64()?.checked_mul(1_000)?;
+      Some(MarketCandlePayload {
+        open_time,
+        close_time: open_time + interval_ms - 1,
+        open: yahoo_number(opens.and_then(|values| values.get(index)))?,
+        high: yahoo_number(highs.and_then(|values| values.get(index)))?,
+        low: yahoo_number(lows.and_then(|values| values.get(index)))?,
+        close: yahoo_number(closes.and_then(|values| values.get(index)))?,
+        volume: yahoo_number(volumes.and_then(|values| values.get(index)))
+          .unwrap_or_else(|| "0".to_string()),
+      })
+    })
+    .collect::<Vec<_>>();
+  Ok((
+    MarketQuotePayload {
+      market: "A股指数".to_string(),
+      name: spec.display_name.to_string(),
+      symbol: spec.symbol.to_string(),
+      resolved_market: "A股指数 · Yahoo".to_string(),
+      price: price.map(|value| value.to_string()),
+      change_percent,
+      high_price: yahoo_number(meta.get("regularMarketDayHigh")),
+      low_price: yahoo_number(meta.get("regularMarketDayLow")),
+      quote_volume: yahoo_number(meta.get("regularMarketVolume")),
+      close_time: meta
+        .get("regularMarketTime")
+        .and_then(Value::as_i64)
+        .and_then(|value| value.checked_mul(1_000)),
+      error: None,
+    },
+    candles,
+  ))
+}
+
+async fn fetch_yahoo_index(
+  client: &reqwest::Client,
+  spec: ChinaIndexSpec,
+  interval: &str,
+) -> Result<(MarketQuotePayload, Vec<MarketCandlePayload>), String> {
+  let response = client
+    .get(yahoo_chart_url(spec, interval))
+    .send()
+    .await
+    .map_err(|error| format!("Yahoo 指数请求失败：{error}"))?;
+  let status = response.status();
+  let body = response
+    .text()
+    .await
+    .map_err(|error| format!("读取 Yahoo 指数响应失败：{error}"))?;
+  if !status.is_success() {
+    return Err(format!("Yahoo 指数请求失败：HTTP {status}"));
+  }
+  parse_yahoo_chart(&body, spec, interval)
+}
+
+fn parse_futu_initial_state(body: &str) -> Result<Value, String> {
+  const MARKER: &str = "window.__INITIAL_STATE__=";
+  let start = body
+    .find(MARKER)
+    .map(|index| index + MARKER.len())
+    .ok_or_else(|| "富途指数页面缺少行情数据".to_string())?;
+  let remaining = &body[start..];
+  let end = remaining
+    .find(";(function()")
+    .or_else(|| remaining.find(";</script>"))
+    .ok_or_else(|| "富途指数页面行情数据不完整".to_string())?;
+  serde_json::from_str(&remaining[..end])
+    .map_err(|error| format!("解析富途指数行情失败：{error}"))
+}
+
+fn parse_futu_number(value: Option<&Value>) -> Option<f64> {
+  match value {
+    Some(Value::Number(number)) => number.as_f64(),
+    Some(Value::String(text)) => text
+      .trim()
+      .trim_end_matches('%')
+      .parse::<f64>()
+      .ok(),
+    _ => None,
+  }
+  .filter(|value| value.is_finite())
+}
+
+fn parse_futu_index_page(
+  body: &str,
+  spec: ChinaIndexSpec,
+) -> Result<(MarketQuotePayload, Vec<FutuMinutePoint>), String> {
+  let payload = parse_futu_initial_state(body)?;
+  let stock = payload
+    .get("stock_info")
+    .ok_or_else(|| "富途指数报价字段不完整".to_string())?;
+  let chart = payload
+    .pointer("/stock_charts_data/minuteChartsData")
+    .ok_or_else(|| "富途指数分时字段不完整".to_string())?;
+  let minute_points = chart
+    .get("list")
+    .and_then(Value::as_array)
+    .ok_or_else(|| "富途指数分时数据不完整".to_string())?
+    .iter()
+    .filter_map(|point| {
+      Some(FutuMinutePoint {
+        time: point.get("time")?.as_i64()?,
+        price: parse_futu_number(point.get("cc_price"))?,
+        volume: parse_futu_number(point.get("volume")).unwrap_or(0.0),
+      })
+    })
+    .collect::<Vec<_>>();
+  if minute_points.is_empty() {
+    return Err("富途暂未返回该指数分时行情".to_string());
+  }
+  let price = parse_futu_number(stock.get("price"))
+    .or_else(|| minute_points.last().map(|point| point.price));
+  let quote_volume = minute_points
+    .iter()
+    .map(|point| point.volume)
+    .sum::<f64>();
+  Ok((
+    MarketQuotePayload {
+      market: "A股指数".to_string(),
+      name: spec.display_name.to_string(),
+      symbol: spec.symbol.to_string(),
+      resolved_market: "A股指数 · 富途".to_string(),
+      price: price.map(|value| value.to_string()),
+      change_percent: parse_futu_number(stock.get("changeRatio"))
+        .map(|value| value.to_string()),
+      high_price: parse_futu_number(stock.get("priceHighest"))
+        .map(|value| value.to_string()),
+      low_price: parse_futu_number(stock.get("priceLowest"))
+        .map(|value| value.to_string()),
+      quote_volume: Some(quote_volume.to_string()),
+      close_time: stock
+        .get("time")
+        .and_then(Value::as_i64)
+        .or_else(|| minute_points.last().and_then(|point| point.time.checked_mul(1_000))),
+      error: None,
+    },
+    minute_points,
+  ))
+}
+
+fn aggregate_futu_candles(
+  minute_points: &[FutuMinutePoint],
+  interval: &str,
+) -> Vec<MarketCandlePayload> {
+  let interval_seconds = if interval == "15m" { 900 } else { 300 };
+  let mut candles = Vec::<MarketCandlePayload>::new();
+  for point in minute_points {
+    let bucket = point.time - point.time.rem_euclid(interval_seconds);
+    if let Some(candle) = candles.last_mut().filter(|candle| {
+      candle.open_time == bucket.saturating_mul(1_000)
+    }) {
+      let high = candle.high.parse::<f64>().unwrap_or(point.price).max(point.price);
+      let low = candle.low.parse::<f64>().unwrap_or(point.price).min(point.price);
+      let volume = candle.volume.parse::<f64>().unwrap_or(0.0) + point.volume;
+      candle.high = high.to_string();
+      candle.low = low.to_string();
+      candle.close = point.price.to_string();
+      candle.volume = volume.to_string();
+      continue;
+    }
+    let open_time = bucket.saturating_mul(1_000);
+    candles.push(MarketCandlePayload {
+      open_time,
+      close_time: open_time + interval_seconds * 1_000 - 1,
+      open: point.price.to_string(),
+      high: point.price.to_string(),
+      low: point.price.to_string(),
+      close: point.price.to_string(),
+      volume: point.volume.to_string(),
+    });
+  }
+  candles
+}
+
+async fn fetch_futu_index(
+  client: &reqwest::Client,
+  spec: ChinaIndexSpec,
+  interval: &str,
+) -> Result<(MarketQuotePayload, Vec<MarketCandlePayload>), String> {
+  let cache = FUTU_INDEX_CACHE.get_or_init(|| Mutex::new(None));
+  if let Ok(guard) = cache.lock() {
+    if let Some(cached) = guard
+      .as_ref()
+      .filter(|cached| cached.fetched_at.elapsed() < FUTU_INDEX_CACHE_TTL)
+    {
+      return Ok((
+        cached.quote.clone(),
+        aggregate_futu_candles(&cached.minute_points, interval),
+      ));
+    }
+  }
+  let response = client
+    .get("https://www.futunn.com/index/930955-SH")
+    .header("Referer", "https://www.futunn.com/")
+    .send()
+    .await
+    .map_err(|error| format!("富途指数请求失败：{error}"))?;
+  let status = response.status();
+  let body = response
+    .text()
+    .await
+    .map_err(|error| format!("读取富途指数响应失败：{error}"))?;
+  if !status.is_success() {
+    return Err(format!("富途指数请求失败：HTTP {status}"));
+  }
+  let (quote, minute_points) = parse_futu_index_page(&body, spec)?;
+  if let Ok(mut guard) = cache.lock() {
+    *guard = Some(FutuIndexCache {
+      fetched_at: Instant::now(),
+      quote: quote.clone(),
+      minute_points: minute_points.clone(),
+    });
+  }
+  Ok((quote, aggregate_futu_candles(&minute_points, interval)))
+}
+
+async fn fetch_china_index_data(
+  client: &reqwest::Client,
+  spec: ChinaIndexSpec,
+  interval: &str,
+  limit: usize,
+) -> Result<(MarketQuotePayload, Vec<MarketCandlePayload>), String> {
+  match spec.source {
+    ChinaIndexSource::Tencent => fetch_tencent_index(client, spec, interval, limit).await,
+    ChinaIndexSource::Yahoo => match fetch_yahoo_index(client, spec, interval).await {
+      Ok(data) => Ok(data),
+      Err(yahoo_error) => fetch_futu_index(client, spec, interval)
+        .await
+        .map_err(|futu_error| format!("{yahoo_error}；备用源失败：{futu_error}")),
+    },
+  }
+}
+
+async fn fetch_market_quote_item(
+  client: &reqwest::Client,
+  item: MarketItemConfig,
+) -> MarketQuotePayload {
+  let provider = match parse_market_provider(&item.market) {
+    Ok(provider) => provider,
+    Err(error) => {
+      return MarketQuotePayload {
+        market: item.market,
+        name: item.name,
+        symbol: String::new(),
+        resolved_market: String::new(),
+        price: None,
+        change_percent: None,
+        high_price: None,
+        low_price: None,
+        quote_volume: None,
+        close_time: None,
+        error: Some(error),
+      };
+    }
+  };
+  if provider == MarketProvider::ChinaIndex {
+    let spec = match resolve_china_index(&item.name) {
+      Ok(spec) => spec,
+      Err(error) => {
+        return MarketQuotePayload {
+          market: item.market,
+          name: item.name,
+          symbol: String::new(),
+          resolved_market: String::new(),
+          price: None,
+          change_percent: None,
+          high_price: None,
+          low_price: None,
+          quote_volume: None,
+          close_time: None,
+          error: Some(error),
+        };
+      }
+    };
+    return match fetch_china_index_data(client, spec, "5m", 2).await {
+      Ok((mut quote, _)) => {
+        quote.market = item.market;
+        quote.name = item.name;
+        quote
+      }
+      Err(error) => MarketQuotePayload {
+        market: item.market,
+        name: item.name,
+        symbol: spec.symbol.to_string(),
+        resolved_market: String::new(),
+        price: None,
+        change_percent: None,
+        high_price: None,
+        low_price: None,
+        quote_volume: None,
+        close_time: None,
+        error: Some(error),
+      },
+    };
+  }
+  let symbol = match normalize_market_symbol(&item.name) {
+    Ok(symbol) => symbol,
+    Err(error) => {
+      return MarketQuotePayload {
+        market: item.market,
+        name: item.name,
+        symbol: String::new(),
+        resolved_market: String::new(),
+        price: None,
+        change_percent: None,
+        high_price: None,
+        low_price: None,
+        quote_volume: None,
+        close_time: None,
+        error: Some(error),
+      };
+    }
+  };
+  let market_kind = match provider {
+    MarketProvider::Binance(kind) => kind,
+    MarketProvider::ChinaIndex => unreachable!(),
+  };
+
+  let candidates: &[BinanceMarketKind] = match market_kind {
+    BinanceMarketKind::Auto => &[BinanceMarketKind::Futures, BinanceMarketKind::Spot],
+    BinanceMarketKind::Futures => &[BinanceMarketKind::Futures],
+    BinanceMarketKind::Spot => &[BinanceMarketKind::Spot],
+  };
+  let mut errors = Vec::new();
+  for candidate in candidates {
+    match fetch_binance_ticker(client, *candidate, &symbol).await {
+      Ok(ticker) => {
+        return MarketQuotePayload {
+          market: item.market,
+          name: item.name,
+          symbol,
+          resolved_market: binance_market_name(*candidate).to_string(),
+          price: Some(ticker.last_price),
+          change_percent: Some(ticker.price_change_percent),
+          high_price: Some(ticker.high_price),
+          low_price: Some(ticker.low_price),
+          quote_volume: Some(ticker.quote_volume),
+          close_time: Some(ticker.close_time),
+          error: None,
+        };
+      }
+      Err(error) => errors.push(format!("{}：{error}", binance_market_name(*candidate))),
+    }
+  }
+
+  MarketQuotePayload {
+    market: item.market,
+    name: item.name,
+    symbol,
+    resolved_market: String::new(),
+    price: None,
+    change_percent: None,
+    high_price: None,
+    low_price: None,
+    quote_volume: None,
+    close_time: None,
+    error: Some(format!("未找到该交易对。{}", errors.join("；"))),
+  }
+}
+
+#[tauri::command]
+fn load_market_config(app: AppHandle) -> Result<MarketConfigPayload, String> {
+  let cfg = load_app_config_from_file(&app)?;
+  Ok(MarketConfigPayload {
+    items: cfg.market.items,
+  })
+}
+
+#[tauri::command]
+fn save_market_config(
+  app: AppHandle,
+  items: Vec<MarketItemConfig>,
+) -> Result<MarketConfigPayload, String> {
+  if items.is_empty() {
+    return Err("请至少保留一个行情".to_string());
+  }
+  if items.len() > MARKET_MAX_ITEMS {
+    return Err(format!("最多支持 {MARKET_MAX_ITEMS} 个行情"));
+  }
+
+  let mut normalized_items = Vec::with_capacity(items.len());
+  for item in items {
+    let market = item.market.trim().to_string();
+    let name = item.name.trim().to_string();
+    if market.is_empty() || name.is_empty() {
+      return Err("市场和名称不能为空".to_string());
+    }
+    match parse_market_provider(&market)? {
+      MarketProvider::Binance(_) => {
+        normalize_market_symbol(&name)?;
+      }
+      MarketProvider::ChinaIndex => {
+        resolve_china_index(&name)?;
+      }
+    }
+    if !normalized_items
+      .iter()
+      .any(|existing: &MarketItemConfig| existing.market == market && existing.name == name)
+    {
+      normalized_items.push(MarketItemConfig { market, name });
+    }
+  }
+
+  let mut cfg = load_app_config_from_file(&app)?;
+  cfg.market.items = normalized_items;
+  save_app_config_to_file(&app, &cfg)?;
+  Ok(MarketConfigPayload {
+    items: cfg.market.items,
+  })
+}
+
+#[tauri::command]
+async fn fetch_market_quotes(items: Vec<MarketItemConfig>) -> Result<Vec<MarketQuotePayload>, String> {
+  if items.is_empty() {
+    return Ok(Vec::new());
+  }
+  if items.len() > MARKET_MAX_ITEMS {
+    return Err(format!("最多支持 {MARKET_MAX_ITEMS} 个行情"));
+  }
+  let client = reqwest::Client::builder()
+    .use_rustls_tls()
+    .connect_timeout(MARKET_CONNECT_TIMEOUT)
+    .timeout(MARKET_REQUEST_TIMEOUT)
+    .user_agent("Topdo/2.2 market-board")
+    .build()
+    .map_err(|error| format!("创建行情客户端失败：{error}"))?;
+  let mut quotes = Vec::with_capacity(items.len());
+  for item in items {
+    quotes.push(fetch_market_quote_item(&client, item).await);
+  }
+  Ok(quotes)
+}
+
+#[tauri::command]
+async fn fetch_market_klines(
+  market: String,
+  name: String,
+  interval: Option<String>,
+  limit: Option<usize>,
+) -> Result<MarketKlinePayload, String> {
+  let interval = normalize_kline_interval(interval.as_deref().unwrap_or("5m"))?;
+  let limit = limit.unwrap_or(96).clamp(24, 240);
+  let provider = parse_market_provider(&market)?;
+  let client = reqwest::Client::builder()
+    .use_rustls_tls()
+    .connect_timeout(MARKET_CONNECT_TIMEOUT)
+    .timeout(MARKET_REQUEST_TIMEOUT)
+    .user_agent("Topdo/2.2 market-board")
+    .build()
+    .map_err(|error| format!("创建行情客户端失败：{error}"))?;
+  if provider == MarketProvider::ChinaIndex {
+    let spec = resolve_china_index(&name)?;
+    let (quote, mut candles) = fetch_china_index_data(&client, spec, interval, limit).await?;
+    if candles.len() > limit {
+      candles = candles.split_off(candles.len() - limit);
+    }
+    if candles.is_empty() {
+      return Err(format!("暂未获取到{}的 {} K 线", spec.display_name, interval));
+    }
+    return Ok(MarketKlinePayload {
+      market,
+      name,
+      symbol: spec.symbol.to_string(),
+      resolved_market: quote.resolved_market,
+      interval: interval.to_string(),
+      candles,
+    });
+  }
+  let symbol = normalize_market_symbol(&name)?;
+  let market_kind = match provider {
+    MarketProvider::Binance(kind) => kind,
+    MarketProvider::ChinaIndex => unreachable!(),
+  };
+  let candidates: &[BinanceMarketKind] = match market_kind {
+    BinanceMarketKind::Auto => &[BinanceMarketKind::Futures, BinanceMarketKind::Spot],
+    BinanceMarketKind::Futures => &[BinanceMarketKind::Futures],
+    BinanceMarketKind::Spot => &[BinanceMarketKind::Spot],
+  };
+  let mut errors = Vec::new();
+  for candidate in candidates {
+    match fetch_binance_klines(&client, *candidate, &symbol, interval, limit).await {
+      Ok(candles) if !candles.is_empty() => {
+        return Ok(MarketKlinePayload {
+          market,
+          name,
+          symbol,
+          resolved_market: binance_market_name(*candidate).to_string(),
+          interval: interval.to_string(),
+          candles,
+        });
+      }
+      Ok(_) => errors.push(format!("{}：暂无 K 线数据", binance_market_name(*candidate))),
+      Err(error) => errors.push(format!("{}：{error}", binance_market_name(*candidate))),
+    }
+  }
+  Err(format!("未找到该交易对的 {interval} K 线。{}", errors.join("；")))
+}
+
 #[tauri::command]
 async fn check_feishu_api_client() -> Result<SyncStatus, String> {
   let client = reqwest::Client::builder()
@@ -4003,59 +5610,170 @@ fn get_window_state(state: State<'_, Mutex<UiState>>) -> Result<WindowStatePaylo
 }
 
 #[tauri::command]
+async fn drag_window_and_reconcile_top_dock(
+  app: AppHandle,
+  state: State<'_, Mutex<UiState>>,
+) -> Result<WindowStatePayload, String> {
+  let window = get_main_window(&app)?;
+  {
+    let state = state
+      .lock()
+      .map_err(|_| "failed to lock ui state".to_string())?;
+    if state.mini_mode || state.top_dock_collapsed {
+      return Ok(WindowStatePayload {
+        mini_mode: state.mini_mode,
+        always_on_top: state.always_on_top,
+        top_docked: state.top_docked,
+        top_dock_collapsed: state.top_dock_collapsed,
+      });
+    }
+  }
+
+  if window.is_maximized().unwrap_or(false) {
+    window.unmaximize().map_err(|err| err.to_string())?;
+  }
+  window.set_maximizable(false).map_err(|err| err.to_string())?;
+  track_native_window_drag(&window).await?;
+
+  let mut state = state
+    .lock()
+    .map_err(|_| "failed to lock ui state".to_string())?;
+  let (_, distance_from_top) = window_top_distance(&window)?;
+  eprintln!(
+    "[Rust] native drag finished: distance_from_top={distance_from_top}, snap_distance={TOP_DOCK_SNAP_DISTANCE}"
+  );
+  let (payload, _) = reconcile_top_dock_window(&window, &mut state)?;
+  drop(state);
+  let _ = app.emit("top-dock-state-changed", payload.clone());
+  Ok(payload)
+}
+
+#[tauri::command]
 fn set_top_dock_mode(
   app: AppHandle,
   state: State<'_, Mutex<UiState>>,
   mode: String,
-  width: f64,
-  height: f64,
 ) -> Result<WindowStatePayload, String> {
   let window = get_main_window(&app)?;
   let mut state = state
     .lock()
     .map_err(|_| "failed to lock ui state".to_string())?;
+  eprintln!(
+    "[Rust] set_top_dock_mode requested: mode={}, docked={}, collapsed={}, armed={}",
+    mode,
+    state.top_docked,
+    state.top_dock_collapsed,
+    state.top_dock_hover_armed,
+  );
   if state.mini_mode {
     return Err("迷你模式下不能启用顶部吸附".to_string());
   }
 
-  let normalized_width = width.max(NORMAL_MIN_WIDTH);
-  let normalized_height = height.max(NORMAL_MIN_HEIGHT);
-  if !state.top_docked {
-    state.top_dock_restore_width = normalized_width;
-    state.top_dock_restore_height = normalized_height;
-  }
-
   match mode.trim() {
     "collapsed" => {
-      let (position, _) = window_top_distance(&window)?;
-      let monitor_top = current_monitor_top(&window)?;
+      if state
+        .top_dock_collapse_blocked_until
+        .is_some_and(|deadline| Instant::now() < deadline)
+      {
+        state.top_dock_collapse_pending = true;
+        eprintln!("[Rust] set_top_dock_mode collapse queued during expand guard");
+        return Ok(WindowStatePayload {
+          mini_mode: state.mini_mode,
+          always_on_top: state.always_on_top,
+          top_docked: state.top_docked,
+          top_dock_collapsed: state.top_dock_collapsed,
+        });
+      }
+      if state.top_docked && !state.top_dock_collapsed {
+        let cursor = window
+          .cursor_position()
+          .map_err(|err| format!("get cursor position failed: {err}"))?;
+        let position = window
+          .outer_position()
+          .map_err(|err| format!("get window position failed: {err}"))?;
+        let size = window
+          .outer_size()
+          .map_err(|err| format!("get window size failed: {err}"))?;
+        let scale_factor = window.scale_factor().map_err(|err| err.to_string())?;
+        let monitor_top = current_monitor_top(&window)?;
+        let cursor_in_window = cursor_inside_window_bounds(cursor, position, size);
+        let cursor_in_hotspot = cursor_inside_top_dock_hotspot(
+          cursor,
+          position,
+          size.width,
+          monitor_top,
+          scale_factor,
+        );
+        if cursor_in_window || cursor_in_hotspot {
+          state.top_dock_collapse_pending = true;
+          eprintln!(
+            "[Rust] set_top_dock_mode collapse queued while cursor remains near panel"
+          );
+          return Ok(WindowStatePayload {
+            mini_mode: state.mini_mode,
+            always_on_top: state.always_on_top,
+            top_docked: state.top_docked,
+            top_dock_collapsed: state.top_dock_collapsed,
+          });
+        }
+      }
+      if state.top_docked && state.top_dock_collapsed {
+        return Ok(WindowStatePayload {
+          mini_mode: state.mini_mode,
+          always_on_top: state.always_on_top,
+          top_docked: state.top_docked,
+          top_dock_collapsed: state.top_dock_collapsed,
+        });
+      }
+      let (_, distance_from_top) = window_top_distance(&window)?;
+      let scale_factor = window.scale_factor().map_err(|err| err.to_string())?;
       state.top_docked = true;
       state.top_dock_collapsed = true;
-      apply_top_dock_size(&window, state.top_dock_restore_width)
-        .map_err(|err| err.to_string())?;
-      window
-        .set_position(Position::Physical(PhysicalPosition::new(position.x, monitor_top)))
-        .map_err(|err| err.to_string())?;
+      state.top_dock_hover_armed = true;
+      state.top_dock_collapse_pending = false;
+      state.top_dock_collapse_blocked_until = None;
+      set_native_top_dock_frame(
+        &window,
+        state.top_dock_restore_width,
+        TOP_DOCK_COLLAPSED_HEIGHT,
+        distance_from_top,
+        scale_factor,
+        true,
+      )?;
     }
     "expanded" => {
-      let (position, _) = window_top_distance(&window)?;
-      let monitor_top = current_monitor_top(&window)?;
+      if state.top_docked && !state.top_dock_collapsed {
+        state.top_dock_collapse_pending = false;
+        return Ok(WindowStatePayload {
+          mini_mode: state.mini_mode,
+          always_on_top: state.always_on_top,
+          top_docked: state.top_docked,
+          top_dock_collapsed: state.top_dock_collapsed,
+        });
+      }
+      let (_, distance_from_top) = window_top_distance(&window)?;
+      let scale_factor = window.scale_factor().map_err(|err| err.to_string())?;
       state.top_docked = true;
       state.top_dock_collapsed = false;
-      apply_panel_constraints(&window).map_err(|err| err.to_string())?;
-      window
-        .set_size(Size::Logical(LogicalSize::new(
-          state.top_dock_restore_width,
-          state.top_dock_restore_height,
-        )))
-        .map_err(|err| err.to_string())?;
-      window
-        .set_position(Position::Physical(PhysicalPosition::new(position.x, monitor_top)))
-        .map_err(|err| err.to_string())?;
+      state.top_dock_hover_armed = false;
+      state.top_dock_collapse_pending = false;
+      state.top_dock_collapse_blocked_until =
+        Some(Instant::now() + TOP_DOCK_EXPAND_GUARD);
+      set_native_top_dock_frame(
+        &window,
+        state.top_dock_restore_width,
+        state.top_dock_restore_height,
+        distance_from_top,
+        scale_factor,
+        true,
+      )?;
     }
     "off" => {
       state.top_docked = false;
       state.top_dock_collapsed = false;
+      state.top_dock_hover_armed = false;
+      state.top_dock_collapse_pending = false;
+      state.top_dock_collapse_blocked_until = None;
       apply_panel_constraints(&window).map_err(|err| err.to_string())?;
       window
         .set_size(Size::Logical(LogicalSize::new(
@@ -4066,13 +5784,6 @@ fn set_top_dock_mode(
     }
     _ => return Err("不支持的顶部吸附模式".to_string()),
   }
-
-  apply_window_traits(
-    &window,
-    state.always_on_top,
-    should_include_native_traits("set_top_dock_mode"),
-    "set_top_dock_mode",
-  )?;
 
   Ok(WindowStatePayload {
     mini_mode: state.mini_mode,
@@ -4087,33 +5798,62 @@ fn reconcile_top_dock_window(
   state: &mut UiState,
 ) -> Result<(WindowStatePayload, bool), String> {
   let (position, distance_from_top) = window_top_distance(window)?;
+  let scale_factor = window
+    .scale_factor()
+    .map_err(|err| format!("get scale factor failed: {err}"))?;
+  let snap_distance = scaled_top_dock_distance(TOP_DOCK_SNAP_DISTANCE, scale_factor);
+  let detach_distance = scaled_top_dock_distance(TOP_DOCK_DETACH_DISTANCE, scale_factor);
   let mut changed = false;
+  eprintln!(
+    "[Rust] reconcile_top_dock_window: x={}, y={}, distance_from_top={}, scale_factor={}, snap_distance={}, mini_mode={}, top_docked={}, collapsed={}",
+    position.x,
+    position.y,
+    distance_from_top,
+    scale_factor,
+    snap_distance,
+    state.mini_mode,
+    state.top_docked,
+    state.top_dock_collapsed
+  );
 
-  if !state.mini_mode && !state.top_docked && distance_from_top <= TOP_DOCK_SNAP_DISTANCE {
+  if should_snap_top_dock(
+    state.mini_mode,
+    state.top_docked,
+    distance_from_top,
+    scale_factor,
+  ) {
     let size = window
       .outer_size()
       .map_err(|err| format!("get window size failed: {err}"))?;
-    let scale_factor = window
-      .scale_factor()
-      .map_err(|err| format!("get scale factor failed: {err}"))?;
     state.top_dock_restore_width = (size.width as f64 / scale_factor).max(NORMAL_MIN_WIDTH);
     state.top_dock_restore_height = (size.height as f64 / scale_factor).max(NORMAL_MIN_HEIGHT);
     state.top_docked = true;
     state.top_dock_collapsed = true;
-    apply_top_dock_size(window, state.top_dock_restore_width).map_err(|err| err.to_string())?;
-    let monitor_top = current_monitor_top(window)?;
-    window
-      .set_position(Position::Physical(PhysicalPosition::new(position.x, monitor_top)))
-      .map_err(|err| err.to_string())?;
+    state.top_dock_hover_armed = false;
+    state.top_dock_collapse_pending = false;
+    state.top_dock_collapse_blocked_until = None;
+    set_native_top_dock_frame(
+      window,
+      state.top_dock_restore_width,
+      TOP_DOCK_COLLAPSED_HEIGHT,
+      distance_from_top,
+      scale_factor,
+      true,
+    )?;
     changed = true;
   } else if !state.mini_mode
     && state.top_docked
     && !state.top_dock_collapsed
-    && distance_from_top > TOP_DOCK_DETACH_DISTANCE
+    && distance_from_top > detach_distance
   {
     state.top_docked = false;
+    state.top_dock_hover_armed = false;
+    state.top_dock_collapse_pending = false;
     apply_panel_constraints(window).map_err(|err| err.to_string())?;
     changed = true;
+  }
+  if !state.top_dock_collapsed {
+    apply_panel_constraints(window).map_err(|err| err.to_string())?;
   }
 
   Ok((
@@ -4199,8 +5939,15 @@ fn show_main_window(app: AppHandle) -> Result<(), String> {
   set_window_mode_internal(&app, "panel")?;
   window.unminimize().map_err(|err| err.to_string())?;
   window.show().map_err(|err| err.to_string())?;
+  ensure_window_visible(&window, "show_main_window")?;
   window.set_focus().map_err(|err| err.to_string())?;
   Ok(())
+}
+
+#[tauri::command]
+fn ensure_main_window_visible(app: AppHandle) -> Result<bool, String> {
+  let window = get_main_window(&app)?;
+  ensure_window_visible(&window, "frontend_size_restore")
 }
 
 #[tauri::command]
@@ -4880,14 +6627,25 @@ async fn save_window_size(app: AppHandle, width: f64, height: f64) -> Result<(),
 #[tauri::command]
 async fn get_window_size(app: AppHandle) -> Result<Option<WindowSizePayload>, String> {
   let file = window_size_file_path(&app)?;
+  let scale_factor = get_main_window(&app)
+    .and_then(|window| window.scale_factor().map_err(|err| err.to_string()))
+    .unwrap_or(1.0)
+    .max(1.0);
 
   tokio::task::spawn_blocking(move || {
     if !file.exists() {
       return Ok::<Option<WindowSizePayload>, String>(None);
     }
-    let content = fs::read_to_string(file).map_err(|err| format!("读取窗口尺寸失败: {err}"))?;
-    let size: WindowSizePayload =
+    let content = fs::read_to_string(&file).map_err(|err| format!("读取窗口尺寸失败: {err}"))?;
+    let mut size: WindowSizePayload =
       serde_json::from_str(&content).map_err(|err| format!("解析窗口尺寸失败: {err}"))?;
+    if size.width > NORMAL_MAX_WIDTH || size.height > NORMAL_MAX_HEIGHT {
+      size.width = (size.width / scale_factor).clamp(NORMAL_MIN_WIDTH, NORMAL_MAX_WIDTH);
+      size.height = (size.height / scale_factor).clamp(NORMAL_MIN_HEIGHT, NORMAL_MAX_HEIGHT);
+      let migrated =
+        serde_json::to_string_pretty(&size).map_err(|err| format!("迁移窗口尺寸失败: {err}"))?;
+      fs::write(&file, migrated).map_err(|err| format!("迁移窗口尺寸失败: {err}"))?;
+    }
     Ok(Some(size))
   })
   .await
@@ -5370,7 +7128,7 @@ async fn sync_tasks(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
+  let app = tauri::Builder::default()
     .plugin(tauri_plugin_autostart::init(
       tauri_plugin_autostart::MacosLauncher::LaunchAgent,
       None,
@@ -5382,8 +7140,11 @@ pub fn run() {
       always_on_top: true,
       top_docked: false,
       top_dock_collapsed: false,
+      top_dock_hover_armed: false,
+      top_dock_collapse_pending: false,
       top_dock_restore_width: NORMAL_WIDTH,
       top_dock_restore_height: NORMAL_HEIGHT,
+      top_dock_collapse_blocked_until: None,
     }))
     .manage(Mutex::new(ConfigIoLock))
     .manage(Mutex::new(GlobalShortcutState::default()))
@@ -5392,6 +7153,10 @@ pub fn run() {
     .setup(|app| {
       create_system_windows(app)?;
       if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.set_maximizable(false);
+        let _ = set_native_window_movable(&window, false);
+        let _ = normalize_initial_panel_size(&window);
+        let _ = ensure_window_visible(&window, "setup");
         let pinned = app
           .state::<Mutex<UiState>>()
           .lock()
@@ -5399,6 +7164,7 @@ pub fn run() {
           .unwrap_or(true);
         let _ = apply_window_traits(&window, pinned, should_include_native_traits("setup"), "setup");
       }
+      start_top_dock_hover_monitor(app.handle().clone());
 
       #[cfg(desktop)]
       {
@@ -5421,29 +7187,13 @@ pub fn run() {
             let _ = window.hide();
           }
         }
-        tauri::WindowEvent::Moved(_) => {
-          let app = window.app_handle();
-          if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-            let state = app.state::<Mutex<UiState>>();
-            let reconciliation = match state.try_lock() {
-              Ok(mut state) => reconcile_top_dock_window(&main_window, &mut state),
-              Err(_) => return,
-            };
-            match reconciliation {
-              Ok((payload, true)) => {
-                let _ = app.emit("top-dock-state-changed", payload);
-              }
-              Ok((_, false)) => {}
-              Err(err) => eprintln!("[Rust] reconcile top dock after move failed: {err}"),
-            }
-          }
-        }
         _ => {}
       }
     })
     .invoke_handler(tauri::generate_handler![
       check_feishu_api_client,
       get_window_state,
+      drag_window_and_reconcile_top_dock,
       set_top_dock_mode,
       reconcile_top_dock,
       reapply_window_traits,
@@ -5452,6 +7202,7 @@ pub fn run() {
       restore_normal_mode,
       hide_window_to_tray,
       show_main_window,
+      ensure_main_window_visible,
       show_quick_capture,
       export_data_file,
       export_daily_receipt_image,
@@ -5460,6 +7211,10 @@ pub fn run() {
       open_export_folder,
       save_config,
       load_config,
+      load_market_config,
+      save_market_config,
+      fetch_market_quotes,
+      fetch_market_klines,
       get_feishu_fields,
       save_feishu_field_mapping,
       get_shortcut_config,
@@ -5502,13 +7257,323 @@ pub fn run() {
       check_in_habit,
       uncheck_in_habit
     ])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application");
+
+  app.run(|app, event| {
+    #[cfg(target_os = "macos")]
+    if let tauri::RunEvent::Reopen { .. } = event {
+      if let Err(err) = show_main_window(app.clone()) {
+        eprintln!("[Rust] restore window on reopen failed: {err}");
+      }
+    }
+  });
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn visible_window_keeps_its_position() {
+    let monitors = [PhysicalBounds {
+      x: 0,
+      y: 0,
+      width: 1920,
+      height: 1080,
+    }];
+    let window = PhysicalBounds {
+      x: 800,
+      y: 277,
+      width: 320,
+      height: 501,
+    };
+
+    assert_eq!(corrected_window_position(window, &monitors), None);
+  }
+
+  #[test]
+  fn bottom_overflow_is_clamped_inside_monitor() {
+    let monitors = [PhysicalBounds {
+      x: 0,
+      y: 0,
+      width: 1920,
+      height: 1080,
+    }];
+    let window = PhysicalBounds {
+      x: 1296,
+      y: 662,
+      width: 320,
+      height: 501,
+    };
+
+    assert_eq!(
+      corrected_window_position(window, &monitors),
+      Some(PhysicalPosition::new(1296, 579))
+    );
+  }
+
+  #[test]
+  fn offscreen_window_uses_nearest_monitor_edge() {
+    let monitors = [
+      PhysicalBounds {
+        x: -1920,
+        y: 0,
+        width: 1920,
+        height: 1080,
+      },
+      PhysicalBounds {
+        x: 0,
+        y: 0,
+        width: 1920,
+        height: 1080,
+      },
+    ];
+    let window = PhysicalBounds {
+      x: 2200,
+      y: 400,
+      width: 320,
+      height: 500,
+    };
+
+    assert_eq!(
+      corrected_window_position(window, &monitors),
+      Some(PhysicalPosition::new(1600, 400))
+    );
+  }
+
+  #[test]
+  fn top_docked_strip_remains_valid() {
+    let monitors = [PhysicalBounds {
+      x: 0,
+      y: 0,
+      width: 1920,
+      height: 1080,
+    }];
+    let window = PhysicalBounds {
+      x: 800,
+      y: 0,
+      width: 320,
+      height: 12,
+    };
+
+    assert_eq!(corrected_window_position(window, &monitors), None);
+  }
+
+  #[test]
+  fn market_symbol_accepts_common_pair_separators() {
+    assert_eq!(normalize_market_symbol(" soxl/usdt ").unwrap(), "SOXLUSDT");
+    assert_eq!(normalize_market_symbol("SNDK-USDT").unwrap(), "SNDKUSDT");
+    assert_eq!(normalize_market_symbol("btc_usdt").unwrap(), "BTCUSDT");
+  }
+
+  #[test]
+  fn market_kind_supports_auto_futures_and_spot_aliases() {
+    assert_eq!(
+      parse_binance_market_kind("币安").unwrap(),
+      BinanceMarketKind::Auto
+    );
+    assert_eq!(
+      parse_binance_market_kind("币安合约").unwrap(),
+      BinanceMarketKind::Futures
+    );
+    assert_eq!(
+      parse_binance_market_kind("Binance Spot").unwrap(),
+      BinanceMarketKind::Spot
+    );
+    assert!(parse_binance_market_kind("纽约证券交易所").is_err());
+  }
+
+  #[test]
+  fn market_provider_supports_china_index_aliases() {
+    assert_eq!(
+      parse_market_provider("A股指数").unwrap(),
+      MarketProvider::ChinaIndex
+    );
+    assert_eq!(
+      parse_market_provider("中证指数").unwrap(),
+      MarketProvider::ChinaIndex
+    );
+    assert_eq!(
+      parse_market_provider("币安").unwrap(),
+      MarketProvider::Binance(BinanceMarketKind::Auto)
+    );
+  }
+
+  #[test]
+  fn china_index_aliases_resolve_to_real_symbols() {
+    assert_eq!(resolve_china_index("上证指数").unwrap().provider_symbol, "sh000001");
+    assert_eq!(resolve_china_index("创业板").unwrap().provider_symbol, "sz399006");
+    assert_eq!(resolve_china_index("科创板").unwrap().provider_symbol, "sh000688");
+    let dividend = resolve_china_index("红利低波指数").unwrap();
+    assert_eq!(dividend.provider_symbol, "930955.SS");
+    assert_eq!(dividend.source, ChinaIndexSource::Yahoo);
+  }
+
+  #[test]
+  fn kline_interval_accepts_five_and_fifteen_minutes() {
+    assert_eq!(normalize_kline_interval("5m").unwrap(), "5m");
+    assert_eq!(normalize_kline_interval("15分钟").unwrap(), "15m");
+    assert!(normalize_kline_interval("1h").is_err());
+  }
+
+  #[test]
+  fn tencent_index_rows_are_mapped_to_quote_and_candles() {
+    let spec = resolve_china_index("上证指数").unwrap();
+    let body = r#"{
+      "data": {
+        "sh000001": {
+          "qt": {"sh000001": ["1","上证指数","000001","3932.70","3930.12","3942.51","477375261","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","","20260907150000","2.58","0.07","3948.42","3916.49","","477375261","89790401"]},
+          "m5": [["202609071500","3933.17","3932.70","3934.12","3932.50","14281681.00"]]
+        }
+      }
+    }"#;
+    let quote = parse_tencent_quote(body, spec).unwrap();
+    assert_eq!(quote.price.as_deref(), Some("3932.70"));
+    assert_eq!(quote.change_percent.as_deref(), Some("0.07"));
+    let candles = parse_tencent_candles(body, spec, "5m").unwrap();
+    assert_eq!(candles.len(), 1);
+    assert_eq!(candles[0].open, "3933.17");
+    assert_eq!(candles[0].close, "3932.70");
+    assert_eq!(candles[0].close_time - candles[0].open_time, 299_999);
+  }
+
+  #[test]
+  fn yahoo_index_chart_is_mapped_to_quote_and_candles() {
+    let spec = resolve_china_index("红利低波100").unwrap();
+    let body = r#"{
+      "chart": {
+        "result": [{
+          "meta": {
+            "regularMarketPrice": 11326.557,
+            "regularMarketChangePercent": -0.755,
+            "regularMarketDayHigh": 11427.139,
+            "regularMarketDayLow": 11282.276,
+            "regularMarketVolume": 1582521274,
+            "regularMarketTime": 1788764424,
+            "chartPreviousClose": 11412.756
+          },
+          "timestamp": [1788764100],
+          "indicators": {"quote": [{
+            "open": [11331.3],
+            "high": [11334.05],
+            "low": [11323.93],
+            "close": [11323.93],
+            "volume": [101361557]
+          }]}
+        }],
+        "error": null
+      }
+    }"#;
+    let (quote, candles) = parse_yahoo_chart(body, spec, "15m").unwrap();
+    assert_eq!(quote.price.as_deref(), Some("11326.557"));
+    assert_eq!(quote.change_percent.as_deref(), Some("-0.755"));
+    assert_eq!(candles.len(), 1);
+    assert_eq!(candles[0].close, "11323.93");
+    assert_eq!(candles[0].close_time - candles[0].open_time, 899_999);
+  }
+
+  #[test]
+  fn futu_index_page_is_mapped_to_quote_and_minute_points() {
+    let spec = resolve_china_index("红利低波100").unwrap();
+    let body = r#"<html><script>window.__INITIAL_STATE__={"stock_info":{"price":"11326.56","changeRatio":"-0.76%","priceHighest":"11427.14","priceLowest":"11282.28","time":1788764400000},"stock_charts_data":{"minuteChartsData":{"list":[{"time":1788764100,"cc_price":11330.0503,"volume":35855065},{"time":1788764160,"cc_price":11328.4525,"volume":43825059}]}}};(function(){})();</script></html>"#;
+    let (quote, points) = parse_futu_index_page(body, spec).unwrap();
+    assert_eq!(quote.price.as_deref(), Some("11326.56"));
+    assert_eq!(quote.change_percent.as_deref(), Some("-0.76"));
+    assert_eq!(quote.resolved_market, "A股指数 · 富途");
+    assert_eq!(points.len(), 2);
+    assert_eq!(points[1].price, 11328.4525);
+  }
+
+  #[test]
+  fn futu_minute_points_are_aggregated_into_requested_interval() {
+    let points = vec![
+      FutuMinutePoint {
+        time: 1_788_764_100,
+        price: 10.0,
+        volume: 2.0,
+      },
+      FutuMinutePoint {
+        time: 1_788_764_160,
+        price: 12.0,
+        volume: 3.0,
+      },
+      FutuMinutePoint {
+        time: 1_788_764_400,
+        price: 9.0,
+        volume: 4.0,
+      },
+    ];
+    let candles = aggregate_futu_candles(&points, "5m");
+    assert_eq!(candles.len(), 2);
+    assert_eq!(candles[0].open, "10");
+    assert_eq!(candles[0].high, "12");
+    assert_eq!(candles[0].close, "12");
+    assert_eq!(candles[0].volume, "5");
+    assert_eq!(candles[1].open, "9");
+  }
+
+  #[test]
+  fn binance_kline_rows_are_mapped_to_candles() {
+    let candles = parse_binance_candles(
+      r#"[[1710000000000,"10.1","10.8","9.9","10.5","120.4",1710000299999,"0",3,"0","0","0"]]"#,
+    )
+    .unwrap();
+    assert_eq!(candles.len(), 1);
+    assert_eq!(candles[0].open_time, 1_710_000_000_000);
+    assert_eq!(candles[0].open, "10.1");
+    assert_eq!(candles[0].high, "10.8");
+    assert_eq!(candles[0].low, "9.9");
+    assert_eq!(candles[0].close, "10.5");
+    assert_eq!(candles[0].close_time, 1_710_000_299_999);
+  }
+
+  #[test]
+  fn top_dock_snaps_at_menu_bar_lower_edge() {
+    assert!(should_snap_top_dock(false, false, 25, 1.0));
+    assert!(should_snap_top_dock(
+      false,
+      false,
+      TOP_DOCK_SNAP_DISTANCE,
+      1.0
+    ));
+    assert!(!should_snap_top_dock(
+      false,
+      false,
+      TOP_DOCK_SNAP_DISTANCE + 1,
+      1.0
+    ));
+    assert!(should_snap_top_dock(false, false, 50, 2.0));
+    assert!(!should_snap_top_dock(false, false, 81, 2.0));
+    assert!(!should_snap_top_dock(true, false, 0, 2.0));
+    assert!(!should_snap_top_dock(false, true, 0, 2.0));
+  }
+
+  #[test]
+  fn top_dock_hover_hotspot_is_generous_on_retina() {
+    let position = PhysicalPosition::new(1180, 0);
+    assert!(cursor_inside_top_dock_hotspot(
+      PhysicalPosition::new(1340.0, 80.0),
+      position,
+      640,
+      0,
+      2.0,
+    ));
+    assert!(!cursor_inside_top_dock_hotspot(
+      PhysicalPosition::new(1340.0, 97.0),
+      position,
+      640,
+      0,
+      2.0,
+    ));
+    assert!(!cursor_inside_top_dock_hotspot(
+      PhysicalPosition::new(1150.0, 40.0),
+      position,
+      640,
+      0,
+      2.0,
+    ));
+  }
 
   fn test_task(record_id: &str, tags: &str) -> Task {
     Task {
